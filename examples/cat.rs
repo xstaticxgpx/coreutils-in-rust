@@ -25,37 +25,26 @@
  */
 
 
-use std::io::{self, Write, BufRead, BufReader};
-
-const NEW_LINE: u8 = 10;
+use std::io::{self, Read, Write, BufReader};
 
 fn main() -> io::Result<()> {
     {
         let stdin = io::stdin().lock();
         let mut stdout = io::stdout().lock();
-        /*
-        let lines = io::stdin().lines();
-        for line in lines {
-            // How to determine missing new line here?
-            stdout.write(line.unwrap().as_bytes())?;
-            // This will add a newline making output mismatched
-            // TODO: read_line instead of lines() ?
-            stdout.write(b"\n")?;
-        }
-        */
+        // TODO: determine buffer size
+        let io_bufsize = 32768;
         let mut buffer = vec![];
         let mut reader = BufReader::new(stdin);
         loop {
-            let r = reader.read_until(NEW_LINE, &mut buffer)?;
-            if r == 0 {
-                eprintln!("EOF");
-                break;
-            }
-            //eprintln!("{:?}", r);
-            //eprintln!("{:?}", buffer);
-            eprintln!("Buffer Length: {}", buffer.len());
-            stdout.write(&buffer)?;
-            buffer.clear();
+            // Use `take` to limit reads given the desired bufsize
+            // As compared to using `read_exact` which requires a sized vector
+            // which can ultimately leave null bytes when reading tail of file
+            let mut handle = reader.by_ref().take(io_bufsize);
+            match handle.read_to_end(&mut buffer) {
+                Ok(0)  => { break; }
+                Ok(_)  => { stdout.write(&buffer)?; buffer = vec![] }
+                Err(_) => { break; }
+            };
         }
     }
     Ok(())
