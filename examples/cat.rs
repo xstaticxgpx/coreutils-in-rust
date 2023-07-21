@@ -32,7 +32,7 @@ fn main() -> io::Result<()> {
         let stdin = io::stdin().lock();
         let mut stdout = io::stdout().lock();
         // TODO: determine buffer size
-        let io_bufsize = 32768;
+        let io_bufsize = 8192;
         let mut buffer = vec![];
         let mut reader = BufReader::new(stdin);
         loop {
@@ -42,10 +42,11 @@ fn main() -> io::Result<()> {
             let mut handle = reader.by_ref().take(io_bufsize);
             match handle.read_to_end(&mut buffer) {
                 Ok(0)  => { break; }
-                Ok(_)  => { stdout.write(&buffer)?; buffer = vec![] }
+                Ok(..) => { stdout.write_all(&buffer)?; buffer.clear() }
                 Err(_) => { break; }
             };
         }
+        stdout.flush()?;
     }
     Ok(())
 }
