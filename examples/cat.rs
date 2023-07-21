@@ -25,17 +25,37 @@
  */
 
 
-use std::io::{self, Write};
+use std::io::{self, Write, BufRead, BufReader};
+
+const NEW_LINE: u8 = 10;
 
 fn main() -> io::Result<()> {
     {
-        let lines = io::stdin().lines();
+        let stdin = io::stdin().lock();
         let mut stdout = io::stdout().lock();
+        /*
+        let lines = io::stdin().lines();
         for line in lines {
             // How to determine missing new line here?
             stdout.write(line.unwrap().as_bytes())?;
             // This will add a newline making output mismatched
+            // TODO: read_line instead of lines() ?
             stdout.write(b"\n")?;
+        }
+        */
+        let mut buffer = vec![];
+        let mut reader = BufReader::new(stdin);
+        loop {
+            let r = reader.read_until(NEW_LINE, &mut buffer)?;
+            if r == 0 {
+                eprintln!("EOF");
+                break;
+            }
+            //eprintln!("{:?}", r);
+            //eprintln!("{:?}", buffer);
+            eprintln!("Buffer Length: {}", buffer.len());
+            stdout.write(&buffer)?;
+            buffer.clear();
         }
     }
     Ok(())
