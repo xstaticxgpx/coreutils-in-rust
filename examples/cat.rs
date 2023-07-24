@@ -26,24 +26,23 @@
  * -> continue loop if more files (arguments) remain
  */
 
-
 use std::fs::File;
 #[allow(unused_imports)]
-use std::io::{self, Read, Write, BufRead, BufWriter};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::os::unix::io::FromRawFd;
 
-// Linux pipes are capped at 65536 byte (16 * 4Kb pages) max buffer by default:
+// Linux pipes are capped at 2^16 == 65536 byte (16 * 4KB pages) max buffer by default:
 // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
 // PAGE_SIZE = 1 << 12; PIPE_DEF_BUFFERS = 16; PAGE_SIZE * PIPE_DEF_BUFFERS == 65536
 // No such limit seems to exist for regular file descriptors so IO_BUFSIZE has no ceiling
 #[allow(dead_code)]
 // TODO: get actual page size?
-const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4Kb usually)
+const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4KB usually)
 #[allow(dead_code)]
 // TODO: for interactive cat use handle.read_until(NEWLINE_CH, &mut buffer)
-const NEWLINE_CH: u8  = 10; // 0x0A
+const NEWLINE_CH: u8 = 10; // 0x0A
 
-fn simple_cat(mut stdin: std::io::StdinLock<>, mut stdout: BufWriter<File>) -> io::Result<()> {
+fn simple_cat(mut stdin: std::io::StdinLock, mut stdout: BufWriter<File>) -> io::Result<()> {
     let handle = stdin.by_ref();
     // HACK!
     // Padding the buffer here then immediately clear prevents subsequent `mremap` during runtime
@@ -56,10 +55,18 @@ fn simple_cat(mut stdin: std::io::StdinLock<>, mut stdout: BufWriter<File>) -> i
         // As compared to using `read_exact` which requires a sized vector
         // which can ultimately leave trailing null bytes when writing EOF
         match handle.take(IO_BUFSIZE).read_to_end(&mut buffer) {
-            Ok(0)  => { /* EOF */ break; }
+            Ok(0) => {
+                /* EOF */
+                break;
+            }
             // Use `write_all` here to ensure we aren't dropping any output
-            Ok(..) => { stdout.write_all(&buffer)?; buffer.clear(); }
-            Err(_) => { break; }
+            Ok(..) => {
+                stdout.write_all(&buffer)?;
+                buffer.clear();
+            }
+            Err(_) => {
+                break;
+            }
         };
     }
     stdout.flush()
