@@ -18,9 +18,8 @@
  * --> FADVISE_SEQUENTIAL if regular file
  * --> error if _non empty_ input file (regular) == output file, continue
  * --> determine implementation (copy_cat / simple_cat / cat)
- * ---> `copy_cat` if no output formatting options provided and input/output are regular files
- * ----> if error use `simple_cat`
- * ---> `simple_cat` if no output formatting options but irregular files (stdin/stdout)?
+ * ---> `copy_cat` if no output formatting options provided and input/output are regular files both on the same device (?)
+ * ---> `simple_cat` if no output formatting options and `copy_cat` fails because irregular files (stdin/stdout) or different devices (?)
  * ---> `cat` if output is formatted
  * --> chain results using bitwise AND operator (&=) on boolean (`ok`) to determine final exit code
  * --> any failures results in non-zero exit code regardless of where it occurred in the loop
@@ -33,6 +32,10 @@ use std::fs::File;
 use std::io::{self, Read, Write, BufRead, BufWriter};
 use std::os::unix::io::FromRawFd;
 
+// Linux pipes are capped at 65536 byte (16 * 4Kb pages) max buffer by default:
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
+// PAGE_SIZE = 1 << 12; PIPE_DEF_BUFFERS = 16; PAGE_SIZE * PIPE_DEF_BUFFERS == 65536
+// No such limit seems to exist for regular file descriptors so IO_BUFSIZE has no ceiling
 #[allow(dead_code)]
 // TODO: get actual page size?
 const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4Kb usually)
@@ -41,12 +44,9 @@ const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (
 const NEWLINE_CH: u8  = 10; // 0x0A
 
 fn simple_cat(mut stdin: std::io::StdinLock<>, mut stdout: BufWriter<File>) -> io::Result<()> {
-    // Linux kernel caps at 65536 byte (16 * 4Kb pages) max buffer across pipes by default:
-    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
-    // PAGE_SIZE = 1 << 12; PIPE_DEF_BUFFERS = 16; PAGE_SIZE * PIPE_DEF_BUFFERS == 65536
     let handle = stdin.by_ref();
     // HACK!
-    // Padding the buffer here but immediately clear so we can avoid `mremap` during runtime
+    // Padding the buffer here then immediately clear prevents subsequent `mremap` during runtime
     // This also fixes the strange read ramp up seen (8192 .. 8192 .. 16384 .. etc .. IO_BUFSIZE)
     // compared to when an unsized, empty vector is specified
     let mut buffer: Vec<u8> = vec![0; IO_BUFSIZE as usize]; // Vec<u8> holds UTF-8 characters
@@ -62,8 +62,7 @@ fn simple_cat(mut stdin: std::io::StdinLock<>, mut stdout: BufWriter<File>) -> i
             Err(_) => { break; }
         };
     }
-    stdout.flush()?;
-    Ok(())
+    stdout.flush()
 }
 
 fn main() -> io::Result<()> {
