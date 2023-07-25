@@ -24,6 +24,13 @@
  * --> chain results using bitwise AND operator (&=) on boolean (`ok`) to determine final exit code
  * --> any failures results in non-zero exit code regardless of where it occurred in the loop
  * -> continue loop if more files (arguments) remain
+ *
+ *
+ * Interactive usage feature ideas (to distinguish `rat` from `cat`):
+ * - timestamp each output line (-t / --timestamp)
+ * - automatically re-pipe / re-direct through `pv` (--pv)
+ * --> and `jq` / `yq` (re-implement those directly?)
+ * --> line by line ( - buffering output lines in reverse, waiting until user hits enter
  */
 
 use libc::{sysconf, _SC_PAGESIZE};
@@ -42,7 +49,7 @@ use std::os::unix::io::FromRawFd;
  * Eventually with something huge that exceeds physical memory ie. 1<<37 (128GB) it will abort:
  * > memory allocation of 137438953472 bytes failed
  * > ./target/release/examples/cat: Aborted
-*/
+ */
 
 static IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4KB usually)
 #[allow(dead_code)]
@@ -53,6 +60,17 @@ extern "C" fn get_pagesize() -> u64 {
     unsafe { sysconf(_SC_PAGESIZE) as u64 }
 }
 
+/*
+ * Stdout/StdoutLock is wrapped by LineWriter which always flushes writes on newline char:
+ * https://doc.rust-lang.org/std/io/struct.LineWriter.html
+ * https://github.com/rust-lang/rust/blob/8771282d4e7a5c4569e49d1f878fb3ba90a974d0/library/std/src/io/stdio.rs#L535
+ * https://github.com/rust-lang/rust/blob/8771282d4e7a5c4569e49d1f878fb3ba90a974d0/library/std/src/io/buffered/linewriter.rs
+ *
+ * Instead, use BufWriter<File> on the raw file descriptor (std::io::StdoutRaw is not exposed)
+ * This seems like a common complaint:
+ * https://github.com/rust-lang/rust/issues/58326
+ * https://github.com/rust-lang/libs-team/issues/148
+ */
 fn simple_cat(
     mut stdin: std::io::StdinLock,
     mut stdout: BufWriter<File>,
@@ -112,22 +130,11 @@ fn main() -> io::Result<()> {
     let mut _iobufsize = IO_BUFSIZE;
     let _page_size = get_pagesize();
     if _iobufsize % _page_size > 0 {
-        // Fallback to 16 pages
+        // Fallback to 16 pages (pretty sure huge pages are not a concern here)
         // Just for sanity, all page sizes should fit into regular pow2 values >=65536
         // https://en.wikipedia.org/wiki/Page_(computer_memory)#Multiple_page_sizes
         _iobufsize = 16 * _page_size;
     }
-    /*
-     * Stdout/StdoutLock is wrapped by LineWriter which always flushes writes on newline char:
-     * https://doc.rust-lang.org/std/io/struct.LineWriter.html
-     * https://github.com/rust-lang/rust/blob/8771282d4e7a5c4569e49d1f878fb3ba90a974d0/library/std/src/io/stdio.rs#L535
-     * https://github.com/rust-lang/rust/blob/8771282d4e7a5c4569e49d1f878fb3ba90a974d0/library/std/src/io/buffered/linewriter.rs
-     *
-     * Instead, use BufWriter directly on the raw file desc (std::io::StdoutRaw is not exposed)
-     * This seems like a common complaint:
-     * https://github.com/rust-lang/rust/issues/58326
-     * https://github.com/rust-lang/libs-team/issues/148
-     */
     let stdin = io::stdin().lock();
     let _ = io::stdout().lock(); // Do we still want to lock this?
     let stdout = BufWriter::new(unsafe { File::from_raw_fd(1) });
