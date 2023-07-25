@@ -2,8 +2,20 @@
 name = "ratiscat"
 version = "0.1.0"
 edition = "2021"
+authors = ["xstaticxgpx"]
+license = "MIT"
+description = "rat is cat reimplemented in rust with some new features"
+homepage = "https://github.com/xstaticxgpx/ratiscat"
+repository = "https://github.com/xstaticxgpx/ratiscat"
+readme = "README.md"
+keywords = ["coreutils", "uutils", "cross-platform", "cli", "utility"]
+categories = ["command-line-utilities"]
+
+rust-version = "1.71.0"
+
+default-run = "rat"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
