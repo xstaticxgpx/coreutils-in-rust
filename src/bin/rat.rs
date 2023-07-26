@@ -30,16 +30,19 @@
  * - timestamp each output line (-t / --timestamp)
  * - automatically re-pipe / re-direct through `pv` (--pv)
  * --> and `jq` / `yq` (re-implement those directly?)
- * --> line by line ( - buffering output lines in reverse, waiting until user hits enter
+ * --> line by line - buffering output lines in reverse, waiting until user hits enter
+ * --> color automatically by detected line type (ie. `error`, `warn`, `info`, etc)
+ * --> support `cut` like behavior on each line directly to keep ie. timestamps, color, etc
+ * --> don't silently ignore missing files like cat (ie. cat /does/not/exist /etc/hosts)
+ * --> support opening each file in pager one and a time
  */
 
 use libc::{sysconf, _SC_PAGESIZE};
-#[allow(unused_imports)]
 use std::env;
 use std::fs::File;
-#[allow(unused_imports)]
-use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::io::FromRawFd;
+use std::process::ExitCode;
 
 /*
  * Linux pipes are capped at 2^16 == 65536 byte (16 * 4KB pages) max buffer by default:
@@ -72,11 +75,10 @@ extern "C" fn get_pagesize() -> u64 {
  * https://github.com/rust-lang/libs-team/issues/148
  */
 fn simple_cat(
-    mut stdin: std::io::StdinLock,
-    mut stdout: BufWriter<File>,
-    _iobufsize: u64,
+    mut input: BufReader<File>,
+    output: &mut BufWriter<File>,
+    iobufsize: u64,
 ) -> io::Result<()> {
-    let stdin = stdin.by_ref();
     /*
      * HACK!
      * Padding the buffer here then immediately clear prevents subsequent `mremap` during runtime
@@ -101,20 +103,21 @@ fn simple_cat(
      * write(1, ""..., 131072)                 = 131072
      * ...
      */
-    let mut buffer: Vec<u8> = vec![0; _iobufsize as usize]; // Vec<u8> holds UTF-8 characters
+    let input = input.by_ref();
+    let mut buffer: Vec<u8> = vec![0; iobufsize as usize]; // Vec<u8> holds UTF-8 characters
     buffer.clear();
     loop {
         // Use `take` and `read_to_end` to limit reads given the desired bufsize
         // As compared to using `read_exact` which requires a sized vector
         // which can ultimately leave trailing null bytes when writing EOF
-        match stdin.take(_iobufsize).read_to_end(&mut buffer) {
+        match input.take(iobufsize).read_to_end(&mut buffer) {
             Ok(0) => {
-                /* EOF */
+                // EOF
                 break;
             }
-            // Use `write_all` here to ensure we aren't dropping any output
             Ok(..) => {
-                stdout.write_all(&buffer)?;
+                // Use `write_all` here to ensure we aren't dropping any output
+                output.write_all(&buffer)?;
                 buffer.clear();
             }
             Err(_) => {
@@ -123,10 +126,10 @@ fn simple_cat(
         };
     }
     // Just for sanity, also implicitly returns Ok(())
-    stdout.flush()
+    output.flush()
 }
 
-fn main() -> io::Result<()> {
+fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
     let mut _iobufsize = IO_BUFSIZE;
     let _page_size = get_pagesize();
     if _iobufsize % _page_size > 0 {
@@ -135,8 +138,49 @@ fn main() -> io::Result<()> {
         // https://en.wikipedia.org/wiki/Page_(computer_memory)#Multiple_page_sizes
         _iobufsize = 16 * _page_size;
     }
-    let stdin = io::stdin().lock();
-    let _ = io::stdout().lock(); // Do we still want to lock this?
-    let stdout = BufWriter::new(unsafe { File::from_raw_fd(1) });
-    simple_cat(stdin, stdout, _iobufsize)
+
+    // Not sure these locks are necessary, doesn't hurt?
+    let (_, _) = (io::stdin().lock(), io::stdout().lock());
+    let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(1) });
+    let mut _stdin = || unsafe { File::from_raw_fd(0) };
+
+    // Skip the cmdline arg here
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    // Pass implict stdin if not given any parameters
+    if args.len() == 0 {
+        args.push(String::from("-"));
+    }
+    // Only accept positional file arguments for now
+    for arg in args {
+        if arg == "-" {
+            // Since stdin is always opened not sure how to re-use the logic below
+            simple_cat(BufReader::new(_stdin()), &mut stdout, _iobufsize)?;
+            continue;
+        }
+        let ref file = arg;
+        match File::open(file) {
+            Ok(file) => {
+                simple_cat(BufReader::new(file), &mut stdout, _iobufsize)?;
+            }
+            Err(e) => {
+                // TODO: parse Err
+                eprintln!("rat: {}: No such file or directory", &file);
+                if strict {
+                    return Err(e);
+                }
+                *ok &= false;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
+    // TODO: change cli to return `ok` equivalent?
+    let mut ok = true;
+    let _ = cli(&mut ok, false);
+    match ok {
+        true => ExitCode::SUCCESS,
+        false => ExitCode::FAILURE,
+    }
 }
