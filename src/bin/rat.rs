@@ -38,21 +38,14 @@
  */
 
 use libc::{sysconf, _SC_PAGESIZE};
+use std::cmp::min;
 use std::env;
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write}; // BufRead
-use std::os::unix::io::FromRawFd;
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Read, Write}; //BufRead
+use std::os::linux::fs::MetadataExt;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::io::FromRawFd; //AsRawFd
 use std::process::ExitCode;
-
-/*
- * Linux pipes are capped at 2^16 == 65536 byte (16 * 4KB pages) max buffer by default:
- * https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
- * PAGE_SIZE = 1 << 12; PIPE_DEF_BUFFERS = 16; PAGE_SIZE * PIPE_DEF_BUFFERS == 65536
- * No such limit seems to exist for regular file descriptors so IO_BUFSIZE has no limit
- * Eventually with something huge that exceeds physical memory ie. 1<<37 (128GB) it will abort:
- * > memory allocation of 137438953472 bytes failed
- * > ./target/release/examples/cat: Aborted
- */
 
 const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4KB usually)
 #[allow(dead_code)]
@@ -112,19 +105,25 @@ fn simple_cat(
 }
 
 fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
-    let mut _iobufsize = IO_BUFSIZE;
-    let _page_size = get_pagesize();
-    if _iobufsize % _page_size > 0 {
-        // Fallback to 16 pages (pretty sure huge pages are not a concern here)
-        // Just for sanity, all page sizes should fit into regular pow2 values >=65536
-        // https://en.wikipedia.org/wiki/Page_(computer_memory)#Multiple_page_sizes
-        _iobufsize = 16 * _page_size;
-    }
+    let (mut _bin, mut _bout) = (IO_BUFSIZE, IO_BUFSIZE);
+    let page_size = get_pagesize();
+    let iobufsize = |i, o| min(i, o);
 
     // Not sure these locks are necessary, doesn't hurt?
     let (_, _) = (io::stdin().lock(), io::stdout().lock());
     let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
     let mut _stdin = || unsafe { File::from_raw_fd(STDIN_FD) };
+
+    // Determine output characteristics, follows the /dev/stdout symlink
+    let _stdout_stat = fs::metadata("/dev/stdout")?;
+    if _stdout_stat.file_type().is_fifo() {
+        /*
+         * Linux pipes are capped at 2^16 == 65536 byte (16 * 4KB pages) max buffer by default:
+         * https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
+         * PAGE_SIZE = 1 << 12; PIPE_DEF_BUFFERS = 16; PAGE_SIZE * PIPE_DEF_BUFFERS == 65536
+         */
+        _bout = 16 * page_size;
+    }
 
     // Skip the cmdline arg here and re-collect as Strings
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -133,16 +132,45 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
         args.push(String::from("-"));
     }
     // Only accept positional file arguments for now
+    let _stdin_stat = fs::metadata("/dev/stdin")?;
     for arg in args {
-        if arg == "-" {
-            // Since stdin is always opened not sure how to re-use the logic below
-            simple_cat(BufReader::new(_stdin()), &mut stdout, _iobufsize)?;
+        // You could also pass the stdin character devices...
+        if arg == "-" || arg == "/dev/stdin" || arg == "/proc/self/fd/0" {
+            if _stdin_stat.file_type().is_fifo() {
+                _bin = 16 * page_size;
+            }
+            simple_cat(
+                BufReader::new(_stdin()),
+                &mut stdout,
+                iobufsize(_bin, _bout),
+            )?;
             continue;
         }
+
         let ref file = arg;
+        // Use `if let` here to ignore ENOENT error on stat
+        if let Ok(_) = fs::metadata(file) {
+            if _stdin_stat.is_file()
+                && _stdout_stat.is_file()
+                && _stdin_stat.st_dev() == _stdout_stat.st_dev()
+                && _stdin_stat.st_ino() == _stdout_stat.st_ino()
+            {
+                /*
+                 * Same as coreutils cat. To test:
+                 * echo hello > foo
+                 * rat foo >> foo
+                 *
+                 * Note the append (>>), when overwriting (>) the shell completely truncates the file
+                 * which results in a empty file regardless of whatever command is run. (ie. `:>foo`)
+                 */
+                eprintln!("rat: {}: input file is output file", file);
+                continue;
+            }
+        }
+
         match File::open(file) {
             Ok(f) => {
-                simple_cat(BufReader::new(f), &mut stdout, _iobufsize)?;
+                simple_cat(BufReader::new(f), &mut stdout, iobufsize(_bin, _bout))?;
             }
             Err(e) => {
                 // TODO: parse Err
