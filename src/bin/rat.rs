@@ -15,7 +15,7 @@
  * ---> if error then report, continue
  * --> get fstat of the input descriptor
  * ----> io_blksize? https://github.com/coreutils/coreutils/blob/master/src/ioblksize.h#L77
- * --> FADVISE_SEQUENTIAL if regular file
+ * --> FADVISE_SEQUENTIAL if regular file (after file open)
  * --> error if _non empty_ input file (regular) == output file, continue
  * --> determine implementation (copy_cat / simple_cat / cat)
  * ---> `copy_cat` if no output formatting options provided and input/output are regular files both on the same device (?)
@@ -40,7 +40,7 @@
 use libc::{sysconf, _SC_PAGESIZE};
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write}; // BufRead
 use std::os::unix::io::FromRawFd;
 use std::process::ExitCode;
 
@@ -54,10 +54,12 @@ use std::process::ExitCode;
  * > ./target/release/examples/cat: Aborted
  */
 
-static IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4KB usually)
+const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4KB usually)
 #[allow(dead_code)]
 // TODO: for interactive cat use handle.read_until(NEWLINE_CH, &mut buffer)
 const NEWLINE_CH: u8 = 10; // 0x0A
+const STDIN_FD: i32 = 0;
+const STDOUT_FD: i32 = 1;
 
 extern "C" fn get_pagesize() -> u64 {
     unsafe { sysconf(_SC_PAGESIZE) as u64 }
@@ -79,53 +81,33 @@ fn simple_cat(
     output: &mut BufWriter<File>,
     iobufsize: u64,
 ) -> io::Result<()> {
-    /*
-     * HACK!
-     * Padding the buffer here then immediately clear prevents subsequent `mremap` during runtime
-     * This also fixes the strange read ramp up seen (8192 .. 8192 .. 16384 .. etc .. IO_BUFSIZE)
-     * compared to when an unsized, empty vector is specified:
-     *
-     * read(0, ""..., 8192)                    = 8192
-     * read(0, ""..., 8192)                    = 8192
-     * read(0, ""..., 16384)                   = 16384
-     * read(0, ""..., 32768)                   = 32768
-     * mmap(NULL, 135168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fb0a8020000
-     * read(0, ""..., 65536)                   = 65536
-     * mremap(0x7fb0a8020000, 135168, 266240, MREMAP_MAYMOVE) = 0x7fb0a7dc7000
-     * write(1, ""..., 131072)                 = 131072
-     * read(0, ""..., 131072)                  = 131072
-     * ...
-     *
-     * vs. with the padded and cleared buffer:
-     *
-     * mmap(NULL, 135168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f239e1c0000
-     * read(0, ""..., 131072)                  = 131072
-     * write(1, ""..., 131072)                 = 131072
-     * ...
-     */
     let input = input.by_ref();
-    let mut buffer: Vec<u8> = vec![0; iobufsize as usize]; // Vec<u8> holds UTF-8 characters
-    buffer.clear();
+    // Vec<u8> holds binary UTF-8 characters, no concept of "text mode" here
+    let mut buffer: Vec<u8> = Vec::with_capacity(iobufsize as usize);
+    // Use `take` and `read_to_end` to limit reads given the desired bufsize
+    // As compared to using `read_exact` which requires a sized vector
+    // which can ultimately leave trailing null bytes when writing EOF
+    #[rustfmt::skip]
+    let mut read =  |buffer: &mut Vec<u8>| -> io::Result<usize> {
+        input.take(iobufsize).read_to_end(buffer)
+    };
+    // Use `write_all` here to ensure we aren't dropping any output
+    let mut write = |buffer: &mut Vec<u8>| -> io::Result<()> {
+        output.write_all(buffer)?;
+        buffer.clear();
+        Ok(())
+    };
     loop {
-        // Use `take` and `read_to_end` to limit reads given the desired bufsize
-        // As compared to using `read_exact` which requires a sized vector
-        // which can ultimately leave trailing null bytes when writing EOF
-        match input.take(iobufsize).read_to_end(&mut buffer) {
-            Ok(0) => {
-                // EOF
-                break;
-            }
-            Ok(..) => {
-                // Use `write_all` here to ensure we aren't dropping any output
-                output.write_all(&buffer)?;
-                buffer.clear();
-            }
-            Err(_) => {
-                break;
-            }
-        };
+        match read(&mut buffer) {
+            // EOF
+            Ok(0) => break,
+            // Data in the buffer
+            Ok(..) => write(&mut buffer)?,
+            // Raise errors
+            Err(e) => return Err(e),
+        }
     }
-    // Just for sanity, also implicitly returns Ok(())
+    // Just for sanity, also implicitly returns Ok(()) after loop break above
     output.flush()
 }
 
@@ -141,10 +123,10 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
 
     // Not sure these locks are necessary, doesn't hurt?
     let (_, _) = (io::stdin().lock(), io::stdout().lock());
-    let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(1) });
-    let mut _stdin = || unsafe { File::from_raw_fd(0) };
+    let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
+    let mut _stdin = || unsafe { File::from_raw_fd(STDIN_FD) };
 
-    // Skip the cmdline arg here
+    // Skip the cmdline arg here and re-collect as Strings
     let mut args: Vec<String> = env::args().skip(1).collect();
     // Pass implict stdin if not given any parameters
     if args.len() == 0 {
@@ -159,8 +141,8 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
         }
         let ref file = arg;
         match File::open(file) {
-            Ok(file) => {
-                simple_cat(BufReader::new(file), &mut stdout, _iobufsize)?;
+            Ok(f) => {
+                simple_cat(BufReader::new(f), &mut stdout, _iobufsize)?;
             }
             Err(e) => {
                 // TODO: parse Err
@@ -176,7 +158,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
-    // TODO: change cli to return `ok` equivalent?
+    // `ok` tracks if any file errors occurred in the loop
     let mut ok = true;
     let _ = cli(&mut ok, false);
     match ok {

@@ -19,7 +19,7 @@ $ rat <t/test.rand | pv -r >/dev/null
 $ cat <t/test.rand | pv -r >/dev/null
 [2.04GiB/s]
 
-$ echo test | ./rat - /does/not/exists /etc/hosts /does/not/exists2 | md5sum
+$ echo test | rat - /does/not/exists /etc/hosts /does/not/exists2 | md5sum
 rat: /does/not/exists: No such file or directory
 rat: /does/not/exists2: No such file or directory
 27f2e6689a97a42813e55d44ef29cda4  -
@@ -41,11 +41,11 @@ Things learned in relation to rust:
 
 - `Stdout` in rust will always be wrapped by `LineWriter` which flushes on new line
 
-Wrap the raw file descriptor in `BufWriter<File>` instead for more control
+  Wrap the raw file descriptor in `BufWriter<File>` instead for more control
 
 - Pre-allocation given a Sized `Vec<u8>` for buffer has some interesting impacts on runtime performance
 
-Even when that vector is immediately cleared on runtime the behavior between _initially empty_ vs. _initially Sized_ vector is noticeable
+  Even when that vector is immediately cleared on runtime the behavior between _initially empty_ vs. _initially Sized_ vector is noticeable
 
 
 ### Known Bugs
