@@ -36,11 +36,10 @@
  * --> strict mode, do not gracefully ignore missing files like cat (ie. cat /does/not/exist /etc/hosts)
  */
 
-use libc::{sysconf, _SC_PAGESIZE};
 use std::cmp::min;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write}; //BufRead
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::FromRawFd; //AsRawFd
@@ -52,15 +51,16 @@ use std::process::ExitCode;
 const PIPE_DEF_PAGES: u64 = 16;
 
 const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 pages (4K each usually)
-#[allow(dead_code)]
-// TODO: for interactive cat use handle.read_until(NEWLINE_CH, &mut buffer)
 const NEWLINE_CH: u8 = 10; // 0x0A
-#[allow(dead_code)]
 const STDIN_FD: i32 = 0;
 const STDOUT_FD: i32 = 1;
 
 extern "C" fn get_pagesize() -> u64 {
-    unsafe { sysconf(_SC_PAGESIZE) as u64 }
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+}
+
+extern "C" fn isatty(fd: i32) -> bool {
+    unsafe { libc::isatty(fd) != 0 }
 }
 
 /*
@@ -75,27 +75,38 @@ extern "C" fn get_pagesize() -> u64 {
  * https://github.com/rust-lang/libs-team/issues/148
  */
 fn simple_cat(
-    mut input: BufReader<File>,
+    input: &mut BufReader<File>,
     output: &mut BufWriter<File>,
     bufsize: u64,
 ) -> io::Result<()> {
-    let input = input.by_ref();
+    // Determines if we should flush on newline (interactive terminal)
+    let is_stdin_tty = isatty(STDIN_FD);
+    let is_stdout_tty = isatty(STDOUT_FD);
     // Vec<u8> holds binary UTF-8 characters, no concept of "text mode" here
     let mut buffer: Vec<u8> = Vec::with_capacity(bufsize as usize);
     // Use `take` and `read_to_end` to limit reads given the desired bufsize
-    // As compared to using `read_exact` which requires a sized vector
-    // which can ultimately leave trailing null bytes when writing EOF
     #[rustfmt::skip]
     let mut read =  |buffer: &mut Vec<u8>| -> io::Result<usize> {
-        input.take(bufsize).read_to_end(buffer)
+        let mut _in = input.take(bufsize);
+        if is_stdin_tty && is_stdout_tty {
+            // read up until newline when interactive
+            // TODO: totally unbuffered (character) mode?
+            return _in.read_until(NEWLINE_CH, buffer)
+        };
+        _in.read_to_end(buffer)
     };
     // Use `write_all` here to ensure we aren't dropping any output
     let mut write = |buffer: &mut Vec<u8>| -> io::Result<()> {
         output.write_all(buffer)?;
+        if is_stdout_tty {
+            // output is a terminal and we've reached a newline
+            output.flush()?;
+        }
         buffer.clear();
         Ok(())
     };
     loop {
+        eprintln!("loop");
         match read(&mut buffer) {
             // EOF
             Ok(0) => break,
@@ -111,7 +122,7 @@ fn simple_cat(
 
 fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
     // Define two different buffers, since input/output characteristics could differ
-    // and require a lower common-denominator bufsize for performance
+    // and require a lower common-denominator bufsize for performance (ie. pipes)
     let (mut ibufsize, mut obufsize) = (IO_BUFSIZE, IO_BUFSIZE);
 
     // Get the common bufsize for IO given the specific inputs and outputs
@@ -137,7 +148,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
     // Makes no difference
     let (_, _) = (io::stdin().lock(), io::stdout().lock());
     // We're re-opening stdin below to reuse existing logic
-    //let stdin = || unsafe { File::from_raw_fd(STDIN_FD) };
+    // stdin can only be consumed once, stdout is shared
     let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
 
     // Determine output characteristics, follows the /dev/stdout symlink
@@ -154,15 +165,11 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
     }
 
     // Only accept positional file arguments for now
-    for arg in args {
-        let file: String;
-        // You could also pass the stdin character devices...
-        // TODO: refactor this
-        if arg == "-" || arg == "/dev/stdin" || arg == "/proc/self/fd/0" {
+    for mut file in args {
+        // You could also pass the stdin character devices explicitly...
+        if file == "-" || file == "/dev/stdin" || file == "/proc/self/fd/0" {
             // Let's just use /dev/stdin across the board (for symlink follow metadata)
             file = String::from("/dev/stdin");
-        } else {
-            file = arg;
         }
 
         // Use `if let` here to ignore ENOENT error on non-existing files, etc
@@ -173,6 +180,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
                 && _stdout_stat.is_file()
                 && _file_stat.st_dev() == _stdout_stat.st_dev()
                 && _file_stat.st_ino() == _stdout_stat.st_ino()
+                && _file_stat.st_size() != 0
             {
                 /*
                  * Same as coreutils cat.
@@ -183,7 +191,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
                  * Note the append (>>), when overwriting (>) the shell completely truncates the file
                  * which results in a empty file regardless of whatever command is run. (ie. see `>foo` or `:>foo`)
                  */
-                let mut _compat = |file| -> String {
+                let mut _compat = |file| {
                     if file == "/dev/stdin" {
                         // $ ./rat < foo >> foo
                         // rat: -: input file is output file
@@ -200,13 +208,19 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
         }
 
         // TODO: this will unnescessarily re-open /dev/stdin as fd=3 (no impact)
+        // TODO: fadvise(POSIX_FADV_SEQUENTIAL) ?
         match File::open(&file) {
             Ok(f) => {
+                // Attempt copy_cat equivalent (uses `copy_file_range`)
+                // /dev/stdout can be a symlink to our output
+                if let Ok(_) = fs::copy(file, "/dev/stdout") {
+                    continue;
+                };
                 simple_cat(
-                    BufReader::new(f),
+                    BufReader::new(f).by_ref(),
                     &mut stdout,
                     minbufsize(ibufsize, obufsize),
-                )?;
+                )?
             }
             Err(e) => {
                 // TODO: parse Err

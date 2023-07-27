@@ -4,7 +4,7 @@
 
 Turns out a rat fits in a pipe better than a cat anyways.
 
-![Cat is Jelly](img/cat_is_jelly.png)
+![Baba is You Cat is Jelly](img/baba_cat_is_jelly.png)
 
 See [`rat.rs`](/src/bin/rat.rs)
 
@@ -18,23 +18,32 @@ https://github.com/uutils/coreutils/
 
 As run on and compared to: i7-6800K / 128GB DDR4 (file reads cached) / Linux 6.3.9 / coreutils 9.3 / uutils 0.0.20
 
-#### Regular file <-> regular file
+#### Regular file -> regular file (uses `copy_file_range` if possible)
 
 ```
-# TODO: implement copy_cat
-# dd if=/dev/urandom of=test.rand bs=1MB count=4096
+# 4GB random data sample
+$ dd if=/dev/urandom of=test.rand bs=1MB count=4096
 $ time rat test.rand >test.$(date +%s)
-real    0m1.777s
-user    0m0.010s
-sys     0m1.764s
+real    0m0.004s
+user    0m0.004s
+sys     0m0.000s
+$ time cat test.rand >test.$(date +%s)
+real    0m0.004s
+user    0m0.004s
+sys     0m0.000s
 ```
 
-#### Regular file <-> pipe (FIFO)
+#### Regular file or character device -> Pipe (FIFO)
 ```
-$ time rat test.rand | pv -r >/dev/null
+$ rat test.rand | pv -r >/dev/null
 [2.69GiB/s] # <-- rat does 64K R/W on FIFO pipes, smaller buffers are better sometimes
-$ time cat test.rand | pv -r >/dev/null
+$ cat test.rand | pv -r >/dev/null
 [2.02GiB/s] # <-- cat does 128K writes onto FIFO pipe but 64K reads (??)
+
+$ timeout 5 rat /dev/zero | pv -r >/dev/null
+[5.12GiB/s]
+$ timeout 5 cat /dev/zero | pv -r >/dev/null
+[4.21GiB/s]
 ```
 
 #### Pipe <-> Pipe
@@ -101,7 +110,7 @@ Things learned so far in general:
 - Pre-allocation given a Sized `Vec<u8>` for the buffer handles has some interesting impacts on runtime performance
 
   Even when that vector is immediately cleared on runtime the behavior between _initially empty_ vs. _initially padded_ (_Sized_?) vector is noticeable.
-  `read()` calls seem to ramp up by pow2 starting at 8192 until they each the specified buffer size, instead of just passing the fixed amount of data.
+  `read()` calls seem to ramp up by pow2 starting at 8192 until it reaches the specified buffer size, instead of just passing the fixed amount of data.
 
   Alternatively `Vec.with_capacity` works too and apparently doesn't need to be cleared, so one less line of code.
 
@@ -111,19 +120,15 @@ Things learned so far in general:
   There is still an improvement over traditional syscalls.
   Probably excellent for [network sockets...](https://blog.superpat.com/zero-copy-in-linux-with-sendfile-and-splice)
 
-- GNU `cat` has odd behavior when writing to pipes, it clearly attempts the default 128K buffer size which subsequently halves the performance.
+- Linux pipes are limited to 64K buffers by default. They can be increased up to the sysctl `fs.pipe-max-size` setting (1MB by default).
 
-  Only happens when on the left-side of the pipe (writing), the reads fill and flush the 64K buffer immediately as expected for pipes.
+  You can tweak pipes using `fcntl()` - see [pipe(7) - Pipe Capacity](https://man7.org/linux/man-pages/man7/pipe.7.html) and [fcntl(2) - Changing the capacity of a pipe](https://man7.org/linux/man-pages/man2/fcntl.2.html).
 
-  `rat` easily acheives ~500MB-1GBps+ more throughput here:
+- GNU `cat` has odd behavior when writing to pipes, it clearly attempts to write its default 128K buffer size which subsequently reduces the performance.
 
-```
-$ timeout 5 rat /dev/zero | pv -r >/dev/null
-[5.12GiB/s]
+  Only happens when on the left-side of the pipe (writing), reading pipes will fill and flush the 64K buffer immediately as expected. In between pipes (ie. `echo | cat | grep`) will perform 64K read and write.
 
-$ timeout 5 cat /dev/zero | pv -r >/dev/null
-[4.21GiB/s]
-```
+  `rat` easily acheives ~500MB-1GBps+ more throughput here by using the proper pipe buffer size (see above)
 
 ### Known Bugs
 
@@ -131,8 +136,7 @@ See `TODO` in [`rat.rs`](/src/bin/rat.rs)
 
 - Ctrl+D needs to be pressed twice while interactive
 
-### References
-
+[//]: # (References)
 [1]: https://news.ycombinator.com/item?id=31592934
 [2]: https://old.reddit.com/r/unix/comments/6gxduc/how_is_gnu_yes_so_fast/
 [3]: https://github.com/coreutils/coreutils/blob/master/src/cat.c

@@ -1,6 +1,6 @@
 [package]
 name = "ratiscat"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["xstaticxgpx"]
 license = "MIT"
@@ -10,6 +10,7 @@ repository = "https://github.com/xstaticxgpx/ratiscat"
 readme = "README.md"
 keywords = ["coreutils", "cross-platform", "cli", "utility"]
 categories = ["command-line-utilities"]
+exclude = [".gitignore", "img/", "/NOTES.md", "/rat"]
 
 rust-version = "1.71.0"
 
