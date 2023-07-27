@@ -1,47 +1,83 @@
 # ratiscat
 
-`rat` is a performance oriented re-implementation of `cat` in rust
+`rat` is a performance _matching_ re-implementation of `cat` in rust
+
+Turns out a rat fits in a pipe better than a cat anyways.
+
+![Cat is Jelly](img/cat_is_jelly.png)
 
 See [`rat.rs`](/src/bin/rat.rs)
 
-For a fully fledged coreutils rust stack see `uutils`:
+Maintaining the `read()` / `write()` syscalls pattern via rust abstractions, with a few improvements.
+
+For much higher performance check out the usage of splice in `uu-cat` (comparison below).
 
 https://github.com/uutils/coreutils/
 
 ### Usage
 
-`rat` vs. `cat`
+As run on and compared to: i7-6800K / 128GB DDR4 (file reads cached) / Linux 6.3.9 / coreutils 9.3 / uutils 0.0.20
+
+#### Regular file <-> regular file
 
 ```
-# Regular file to pipe (dd if=/dev/urandom of=test.rand bs=1MB count=4096)
-$ rat <test.rand | pv -r >/dev/null
-[2.69GiB/s] # <--- How is this faster than cat?
-            # `cat` writes 2^17 (128KB) buffer size by default
-            # `rat` detects FIFO in or out and uses 2^16 (64KB)
-            # which results in higher throughput across the pipe
-            # compare with `strace --syscall-limit=100` in front
+# TODO: implement copy_cat
+# dd if=/dev/urandom of=test.rand bs=1MB count=4096
+$ time rat test.rand >test.$(date +%s)
+real    0m1.777s
+user    0m0.010s
+sys     0m1.764s
+```
 
-$ cat <test.rand | pv -r >/dev/null
-[2.09GiB/s]
+#### Regular file <-> pipe (FIFO)
+```
+$ time rat test.rand | pv -r >/dev/null
+[2.69GiB/s] # <-- rat does 64K R/W on FIFO pipes, smaller buffers are better sometimes
+$ time cat test.rand | pv -r >/dev/null
+[2.02GiB/s] # <-- cat does 128K writes onto FIFO pipe but 64K reads (??)
+```
 
-# Pipe to pipe
+#### Pipe <-> Pipe
+```
 $ timeout -s SIGINT 5 yes | rat | pv -r >/dev/null
 [2.85GiB/s]
-
 $ timeout -s SIGINT 5 yes | cat | pv -r >/dev/null
 [2.86GiB/s]
+```
 
-# Argument ordering, error logging
+#### Argument ordering, error logging, sanity checks
+```
 $ echo test | rat - /does/not/exists /etc/hosts /does/not/exists2 | md5sum
 rat: /does/not/exists: No such file or directory
 rat: /does/not/exists2: No such file or directory
 27f2e6689a97a42813e55d44ef29cda4  -
+$ rat < foo >> foo
+rat: -: input file is output file
 
 $ echo test | cat - /does/not/exists /etc/hosts /does/not/exists2 | md5sum
 cat: /does/not/exists: No such file or directory
 cat: /does/not/exists2: No such file or directory
 27f2e6689a97a42813e55d44ef29cda4  -
+$ cat < foo >> foo
+cat: -: input file is output file
+```
 
+#### Some comparisons with `pv` and `uu-cat` (which use splice - try `pv --no-splice`)
+```
+$ timeout 5 pv -r </dev/zero >/dev/null
+[20.3GiB/s]
+$ timeout 5 yes | pv -r >/dev/null
+[6.13GiB/s]
+$ timeout 5 pv -r </dev/zero | pv -q >/dev/null
+[3.39GiB/s]
+$ timeout 5 pv -r </dev/zero | uu-cat >/dev/null
+[3.66GiB/s]
+$ timeout 5 pv -r </dev/zero | pv -q --no-splice >/dev/null
+[2.70GiB/s]
+$ timeout 5 pv -r </dev/zero | rat >/dev/null
+[2.71GiB/s]
+$ timeout 5 pv -r </dev/zero | cat >/dev/null
+[2.66GiB/s]
 ```
 
 ### Motivation
@@ -50,18 +86,56 @@ I just wanted to do this as a learning experience for rust.
 
 At least, that's how it started.
 
-Things learned in relation to rust:
+I intend to make `rat` nearly the same as `cat` (uutils already did all this) but with additional niceties built in, maybe such as:
 
-- `Stdout` in rust will always be wrapped by `LineWriter` which flushes on new line
+- Prefixing lines with timestamps in any arbitrary strftime format
+- Strict mode - pre-emptively detect errors ie. missing files / permissions before providing possibly mangled output
+- Human readable, colorized output of any generic text stream based on patterns (ie. red errors, blue debugs, etc)
 
-  Wrap the raw file descriptor in `BufWriter<File>` instead for more control
+Things learned so far in general:
 
-- Pre-allocation given a Sized `Vec<u8>` for buffer has some interesting impacts on runtime performance
+- `Stdout` in rust will always be wrapped by `LineWriter` which flushes the buffer on [new lines][6]. This seems fine for interactive stdin.
 
-  Even when that vector is immediately cleared on runtime the behavior between _initially empty_ vs. _initially Sized_ vector is noticeable.
-  Alternatively `Vec.with_capacity` works too.
+  For other I/O use the wrapped `BufWriter<File>` on the file descriptor for more flow control otherwise you get a ton of unnescessary small writes.
 
+- Pre-allocation given a Sized `Vec<u8>` for the buffer handles has some interesting impacts on runtime performance
+
+  Even when that vector is immediately cleared on runtime the behavior between _initially empty_ vs. _initially padded_ (_Sized_?) vector is noticeable.
+  `read()` calls seem to ramp up by pow2 starting at 8192 until they each the specified buffer size, instead of just passing the fixed amount of data.
+
+  Alternatively `Vec.with_capacity` works too and apparently doesn't need to be cleared, so one less line of code.
+
+- `splice(2)` can show some insane performance improvements over traditional read()/write() calls
+
+  However, these benefits are only fully realized under specifics conditions (ie. `</dev/zero >/dev/null`) which don't apply to writes on regular files.
+  There is still an improvement over traditional syscalls.
+  Probably excellent for [network sockets...](https://blog.superpat.com/zero-copy-in-linux-with-sendfile-and-splice)
+
+- GNU `cat` has odd behavior when writing to pipes, it clearly attempts the default 128K buffer size which subsequently halves the performance.
+
+  Only happens when on the left-side of the pipe (writing), the reads fill and flush the 64K buffer immediately as expected for pipes.
+
+  `rat` easily acheives ~500MB-1GBps+ more throughput here:
+
+```
+$ timeout 5 rat /dev/zero | pv -r >/dev/null
+[5.12GiB/s]
+
+$ timeout 5 cat /dev/zero | pv -r >/dev/null
+[4.21GiB/s]
+```
 
 ### Known Bugs
 
+See `TODO` in [`rat.rs`](/src/bin/rat.rs)
+
 - Ctrl+D needs to be pressed twice while interactive
+
+### References
+
+[1]: https://news.ycombinator.com/item?id=31592934
+[2]: https://old.reddit.com/r/unix/comments/6gxduc/how_is_gnu_yes_so_fast/
+[3]: https://github.com/coreutils/coreutils/blob/master/src/cat.c
+[4]: https://github.com/coreutils/coreutils/blob/master/src/ioblksize.h#L77
+[5]: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
+[6]: https://github.com/rust-lang/libs-team/issues/148

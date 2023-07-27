@@ -33,8 +33,7 @@
  * --> line by line - buffering output lines in reverse, waiting until user hits enter
  * --> color automatically by detected line type (ie. `error`, `warn`, `info`, etc)
  * --> support `cut` like behavior on each line directly to keep ie. timestamps, color, etc
- * --> don't silently ignore missing files like cat (ie. cat /does/not/exist /etc/hosts)
- * --> support opening each file in pager one and a time
+ * --> strict mode, do not gracefully ignore missing files like cat (ie. cat /does/not/exist /etc/hosts)
  */
 
 use libc::{sysconf, _SC_PAGESIZE};
@@ -47,10 +46,16 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::FromRawFd; //AsRawFd
 use std::process::ExitCode;
 
-const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 page sizes (4KB usually)
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
+// s/PIPE_DEF_BUFFERS/PIPE_DEF_PAGES/ for clarity here
+// TODO: can we get this from the system somehow?
+const PIPE_DEF_PAGES: u64 = 16;
+
+const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 pages (4K each usually)
 #[allow(dead_code)]
 // TODO: for interactive cat use handle.read_until(NEWLINE_CH, &mut buffer)
 const NEWLINE_CH: u8 = 10; // 0x0A
+#[allow(dead_code)]
 const STDIN_FD: i32 = 0;
 const STDOUT_FD: i32 = 1;
 
@@ -72,17 +77,17 @@ extern "C" fn get_pagesize() -> u64 {
 fn simple_cat(
     mut input: BufReader<File>,
     output: &mut BufWriter<File>,
-    iobufsize: u64,
+    bufsize: u64,
 ) -> io::Result<()> {
     let input = input.by_ref();
     // Vec<u8> holds binary UTF-8 characters, no concept of "text mode" here
-    let mut buffer: Vec<u8> = Vec::with_capacity(iobufsize as usize);
+    let mut buffer: Vec<u8> = Vec::with_capacity(bufsize as usize);
     // Use `take` and `read_to_end` to limit reads given the desired bufsize
     // As compared to using `read_exact` which requires a sized vector
     // which can ultimately leave trailing null bytes when writing EOF
     #[rustfmt::skip]
     let mut read =  |buffer: &mut Vec<u8>| -> io::Result<usize> {
-        input.take(iobufsize).read_to_end(buffer)
+        input.take(bufsize).read_to_end(buffer)
     };
     // Use `write_all` here to ensure we aren't dropping any output
     let mut write = |buffer: &mut Vec<u8>| -> io::Result<()> {
@@ -105,72 +110,103 @@ fn simple_cat(
 }
 
 fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
-    let (mut _bin, mut _bout) = (IO_BUFSIZE, IO_BUFSIZE);
-    let page_size = get_pagesize();
-    let iobufsize = |i, o| min(i, o);
+    // Define two different buffers, since input/output characteristics could differ
+    // and require a lower common-denominator bufsize for performance
+    let (mut ibufsize, mut obufsize) = (IO_BUFSIZE, IO_BUFSIZE);
 
-    // Not sure these locks are necessary, doesn't hurt?
+    // Get the common bufsize for IO given the specific inputs and outputs
+    // ie. regular files should r/w at the default 128KB buffer sizes
+    // fifo pipes should r/w at the max 64KB buffer size on Linux
+    // GNU cat notably attempts to write 128KB into fifo pipes and is slower
+    // This is assuming read()/write() calls with no splice magic (like `uu-cat`)
+    // https://man7.org/linux/man-pages/man2/splice.2.html
+    let page_size = get_pagesize();
+    let minbufsize = |i, o| {
+        let _min = min(i, o);
+        if _min % page_size != 0 {
+            // Just for sanity, shouldn't ever happen?
+            panic!(
+                "minimum buffer is not aligned to page size: {} % {} != 0",
+                _min, page_size
+            )
+        }
+        _min
+    };
+
+    // Not sure these locks are necessary in our use case here
+    // Makes no difference
     let (_, _) = (io::stdin().lock(), io::stdout().lock());
+    // We're re-opening stdin below to reuse existing logic
+    //let stdin = || unsafe { File::from_raw_fd(STDIN_FD) };
     let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
-    let mut _stdin = || unsafe { File::from_raw_fd(STDIN_FD) };
 
     // Determine output characteristics, follows the /dev/stdout symlink
     let _stdout_stat = fs::metadata("/dev/stdout")?;
     if _stdout_stat.file_type().is_fifo() {
-        /*
-         * Linux pipes are capped at 2^16 == 65536 byte (16 * 4KB pages) max buffer by default:
-         * https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
-         * PAGE_SIZE = 1 << 12; PIPE_DEF_BUFFERS = 16; PAGE_SIZE * PIPE_DEF_BUFFERS == 65536
-         */
-        _bout = 16 * page_size;
+        obufsize = PIPE_DEF_PAGES * page_size;
     }
 
-    // Skip the cmdline arg here and re-collect as Strings
+    // Skip the 0th cmdline arg here and re-collect as Strings
     let mut args: Vec<String> = env::args().skip(1).collect();
     // Pass implict stdin if not given any parameters
     if args.len() == 0 {
-        args.push(String::from("-"));
+        args.push(String::from("/dev/stdin"));
     }
+
     // Only accept positional file arguments for now
-    let _stdin_stat = fs::metadata("/dev/stdin")?;
     for arg in args {
+        let file: String;
         // You could also pass the stdin character devices...
+        // TODO: refactor this
         if arg == "-" || arg == "/dev/stdin" || arg == "/proc/self/fd/0" {
-            if _stdin_stat.file_type().is_fifo() {
-                _bin = 16 * page_size;
-            }
-            simple_cat(
-                BufReader::new(_stdin()),
-                &mut stdout,
-                iobufsize(_bin, _bout),
-            )?;
-            continue;
+            // Let's just use /dev/stdin across the board (for symlink follow metadata)
+            file = String::from("/dev/stdin");
+        } else {
+            file = arg;
         }
 
-        let ref file = arg;
-        // Use `if let` here to ignore ENOENT error on stat
-        if let Ok(_) = fs::metadata(file) {
-            if _stdin_stat.is_file()
+        // Use `if let` here to ignore ENOENT error on non-existing files, etc
+        // TODO: strict mode?
+        let get_file_stat = || fs::metadata(&file);
+        if let Ok(_file_stat) = get_file_stat() {
+            if _file_stat.is_file()
                 && _stdout_stat.is_file()
-                && _stdin_stat.st_dev() == _stdout_stat.st_dev()
-                && _stdin_stat.st_ino() == _stdout_stat.st_ino()
+                && _file_stat.st_dev() == _stdout_stat.st_dev()
+                && _file_stat.st_ino() == _stdout_stat.st_ino()
             {
                 /*
-                 * Same as coreutils cat. To test:
+                 * Same as coreutils cat.
+                 *
                  * echo hello > foo
                  * rat foo >> foo
                  *
                  * Note the append (>>), when overwriting (>) the shell completely truncates the file
-                 * which results in a empty file regardless of whatever command is run. (ie. `:>foo`)
+                 * which results in a empty file regardless of whatever command is run. (ie. see `>foo` or `:>foo`)
                  */
-                eprintln!("rat: {}: input file is output file", file);
+                let mut _compat = |file| -> String {
+                    if file == "/dev/stdin" {
+                        // $ ./rat < foo >> foo
+                        // rat: -: input file is output file
+                        return String::from("-");
+                    }
+                    file
+                };
+                eprintln!("rat: {}: input file is output file", _compat(file));
                 continue;
+            }
+            if _file_stat.file_type().is_fifo() {
+                ibufsize = PIPE_DEF_PAGES * page_size;
             }
         }
 
-        match File::open(file) {
+        // TODO: this will unnescessarily re-open /dev/stdin as fd=3 (no impact)
+        match File::open(&file) {
             Ok(f) => {
-                simple_cat(BufReader::new(f), &mut stdout, iobufsize(_bin, _bout))?;
+                simple_cat(
+                    BufReader::new(f),
+                    &mut stdout,
+                    minbufsize(ibufsize, obufsize),
+                )?;
             }
             Err(e) => {
                 // TODO: parse Err
