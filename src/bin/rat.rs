@@ -34,29 +34,26 @@
  * --> color automatically by detected line type (ie. `error`, `warn`, `info`, etc)
  * --> support `cut` like behavior on each line directly to keep ie. timestamps, color, etc
  * --> strict mode, do not gracefully ignore missing files like cat (ie. cat /does/not/exist /etc/hosts)
+ * --> escape characters mode (escape_default?)
  */
 
+use nix::fcntl;
 use std::cmp::min;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::FromRawFd; //AsRawFd
 use std::process::ExitCode;
 
-// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/pipe_fs_i.h
-// s/PIPE_DEF_BUFFERS/PIPE_DEF_PAGES/ for clarity here
-// TODO: can we get this from the system somehow?
-const PIPE_DEF_PAGES: u64 = 16;
-
-const IO_BUFSIZE: u64 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 pages (4K each usually)
+const IO_BUFSIZE: i32 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 pages (4K each usually)
 const NEWLINE_CH: u8 = 10; // 0x0A
 const STDIN_FD: i32 = 0;
 const STDOUT_FD: i32 = 1;
 
-extern "C" fn get_pagesize() -> u64 {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+extern "C" fn get_pagesize() -> i64 {
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) }
 }
 
 extern "C" fn isatty(fd: i32) -> bool {
@@ -80,11 +77,6 @@ fn simple_cat(
     bufsize: u64,
     is_stdin: bool,
 ) -> io::Result<()> {
-    // Determines if we should flush on newline (interactive terminal)
-    // Skip this when we're not actually reading from stdin
-    let is_stdin_tty = is_stdin && isatty(STDIN_FD);
-    // Not sure we really care about this?
-    let is_stdout_tty = isatty(STDOUT_FD);
     // Vec<u8> holds binary UTF-8 characters, no concept of "text mode" here
     let mut buffer: Vec<u8> = Vec::with_capacity(bufsize as usize);
     // Use `take` and `read_to_end` to limit reads given the desired bufsize
@@ -93,23 +85,32 @@ fn simple_cat(
         let mut input = input.take(bufsize);
         // ie. read up until newline when interactive
         if bufch > 0 {
-            // TODO: totally unbuffered (character) mode?
             return input.read_until(bufch, buffer);
         };
         input.read_to_end(buffer)
     };
-    // Use `write_all` here to ensure we aren't dropping any output
+
     let mut write = |buffer: &mut Vec<u8>| -> io::Result<()> {
         // TODO: how to prepend output ie. timestamps etc:
+        // Insert generic functions here for arbitrary formatting?
         //let _buffer = ["[TEST] ".as_bytes(), buffer.as_slice()].concat();
         //*buffer = _buffer;
-        output.write(buffer)?;
-        output.flush()?; //noop except when flushing on newlines
-        buffer.clear();
-        Ok(())
+        //output.write(buffer)?;
+        // totally unbuffered (character) write mode:
+        //for i in 0..buffer.len() {
+        //    output.write(&buffer[i..i+1])?;
+        //    output.flush()?;
+        //}
+        output.write_all(buffer.drain(..).as_ref())
     };
 
+    // Fully buffered output by default
     let mut bufch: u8 = 0;
+    // Line buffered when we are fairly certain of interactive terminal
+    // Will also be needed for formatted output modes
+    let is_stdin_tty = is_stdin && isatty(STDIN_FD);
+    let is_stdout_tty = isatty(STDOUT_FD);
+    // cat doesn't care about stdout
     if is_stdin_tty || is_stdout_tty {
         bufch = NEWLINE_CH;
     }
@@ -128,10 +129,6 @@ fn simple_cat(
 }
 
 fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
-    // Define two different buffers, since input/output characteristics could differ
-    // and require a lower common-denominator bufsize for performance (ie. pipes)
-    let (mut ibufsize, mut obufsize) = (IO_BUFSIZE, IO_BUFSIZE);
-
     // Get the common bufsize for IO given the specific inputs and outputs
     // ie. regular files should r/w at the default 128KB buffer sizes
     // fifo pipes should r/w at the max 64KB buffer size on Linux
@@ -139,8 +136,8 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
     // This is assuming read()/write() calls with no splice magic (like `uu-cat`)
     // https://man7.org/linux/man-pages/man2/splice.2.html
     let page_size = get_pagesize();
-    let minbufsize = |i, o| {
-        let _min = min(i, o);
+    let minbufsize = |i: i32, o: i32| -> u64 {
+        let _min = min(i, o) as i64;
         if _min % page_size != 0 {
             // Just for sanity, shouldn't ever happen?
             panic!(
@@ -148,43 +145,45 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
                 _min, page_size
             )
         }
-        _min
+        _min as u64
     };
 
     // Not sure these locks are necessary in our use case here
     // Makes no difference
     let (_, _) = (io::stdin().lock(), io::stdout().lock());
-    // We're re-opening stdin below to reuse existing logic
-    // stdin can only be consumed once, stdout is shared
-    let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
-
     // Determine output characteristics, follows the /dev/stdout symlink
+    let mut obufsize = IO_BUFSIZE;
     let _stdout_stat = fs::metadata("/dev/stdout")?;
     if _stdout_stat.file_type().is_fifo() {
-        obufsize = PIPE_DEF_PAGES * page_size;
+        //obufsize = fcntl::fcntl(STDOUT_FD, fcntl::F_SETPIPE_SZ(IO_BUFSIZE))?;
+        obufsize = fcntl::fcntl(STDOUT_FD, fcntl::F_GETPIPE_SZ)?;
     }
 
     // Skip the 0th cmdline arg here and re-collect as Strings
     let mut args: Vec<String> = env::args().skip(1).collect();
     // Pass implict stdin if not given any parameters
     if args.len() == 0 {
-        args.push(String::from("/dev/stdin"));
+        args.push(String::from("-"));
     }
 
+    // stdout is re-used
+    let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
     // Only accept positional file arguments for now
-    for mut file in args {
-        let mut _is_stdin = false;
+    for file in args {
+        let mut ibufsize = IO_BUFSIZE;
+        let mut _file = file.as_str();
         // You could also pass the stdin character devices explicitly...
         if file == "-" || file == "/dev/stdin" || file == "/proc/self/fd/0" {
-            // Let's just use /dev/stdin across the board (for symlink follow metadata)
-            file = String::from("/dev/stdin");
-            _is_stdin = true;
+            // We want to keep the actual argument value for error message compatibility
+            // But we need to get metadata via one of the symlinks (ie. we can't from `-`)
+            _file = "/dev/stdin";
         }
+        let is_stdin = _file == "/dev/stdin";
 
         let mut _both_reg: bool = false;
         let mut _appending: bool = false;
         // Use `if let` here to ignore ENOENT error on non-existing files, etc
-        if let Ok(_file_stat) = fs::metadata(&file) {
+        if let Ok(_file_stat) = fs::metadata(_file) {
             if _file_stat.is_file()
                 && _stdout_stat.is_file()
                 && _file_stat.st_dev() == _stdout_stat.st_dev()
@@ -200,19 +199,13 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
                  * Note the append (>>), when overwriting (>) the shell completely truncates the file
                  * which results in a empty file regardless of whatever command is run. (ie. see `>foo` or `:>foo`)
                  */
-                let mut _compat = |file| {
-                    if _is_stdin {
-                        // $ ./rat < foo >> foo
-                        // rat: -: input file is output file
-                        return String::from("-");
-                    }
-                    file
-                };
-                eprintln!("rat: {}: input file is output file", _compat(file));
+                eprintln!("rat: {}: input file is output file", file);
+                *ok &= false;
                 continue;
             }
             if _file_stat.file_type().is_fifo() {
-                ibufsize = PIPE_DEF_PAGES * page_size;
+                //ibufsize = fcntl::fcntl(STDIN_FD, fcntl::F_SETPIPE_SZ(IO_BUFSIZE))?;
+                ibufsize = fcntl::fcntl(STDIN_FD, fcntl::F_GETPIPE_SZ)?;
             }
             // If both files are regular we can attempt faster copy method
             _both_reg = _file_stat.is_file() && _stdout_stat.is_file();
@@ -223,7 +216,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
         // TODO: fadvise(POSIX_FADV_SEQUENTIAL) ?
         // Why is it so difficult to manage these file descriptors in rust?
         let _open_file = || {
-            if _is_stdin {
+            if is_stdin {
                 return Ok(unsafe { File::from_raw_fd(STDIN_FD) });
             };
             File::open(&file)
@@ -231,7 +224,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
 
         match _open_file() {
             Ok(mut f) => {
-                // Attempt copy_cat equivalent (this falls back to 8192 buffers)
+                // Attempt copy_cat equivalent
                 // If we detect that we're appending, skip this, to use bigger buffers
                 if _both_reg && !_appending {
                     // TODO: io::copy seems to use sendfile() first then copy_file_range()
@@ -244,16 +237,21 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
                     BufReader::new(f).by_ref(),
                     &mut stdout,
                     minbufsize(ibufsize, obufsize),
-                    _is_stdin,
+                    is_stdin,
                 )?
             }
             Err(e) => {
-                // TODO: parse Err
-                eprintln!("rat: {}: No such file or directory", &file);
+                *ok &= false;
+                //eprintln!("{:#?}", e);
+                match e.kind() {
+                    ErrorKind::NotFound => eprintln!("rat: {}: No such file or directory", &file),
+                    ErrorKind::PermissionDenied => eprintln!("rat: {}: Permission denied", &file),
+                    _ => todo!(),
+                };
                 if strict {
+                    // This needs to happen earlier.
                     return Err(e);
                 }
-                *ok &= false;
             }
         }
     }

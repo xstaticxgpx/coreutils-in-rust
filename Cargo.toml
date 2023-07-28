@@ -21,6 +21,7 @@ default-run = "rat"
 [target.'cfg(unix)'.dependencies]
 #anyhow = "1.0"
 libc = "0.2"
+nix = "0.26"
 
 [profile.release-lto]
 inherits = "release"
