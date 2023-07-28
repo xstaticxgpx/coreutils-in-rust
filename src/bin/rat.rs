@@ -78,36 +78,43 @@ fn simple_cat(
     input: &mut BufReader<File>,
     output: &mut BufWriter<File>,
     bufsize: u64,
+    is_stdin: bool,
 ) -> io::Result<()> {
     // Determines if we should flush on newline (interactive terminal)
-    let is_stdin_tty = isatty(STDIN_FD);
+    // Skip this when we're not actually reading from stdin
+    let is_stdin_tty = is_stdin && isatty(STDIN_FD);
+    // Not sure we really care about this?
     let is_stdout_tty = isatty(STDOUT_FD);
     // Vec<u8> holds binary UTF-8 characters, no concept of "text mode" here
     let mut buffer: Vec<u8> = Vec::with_capacity(bufsize as usize);
     // Use `take` and `read_to_end` to limit reads given the desired bufsize
-    #[rustfmt::skip]
-    let mut read =  |buffer: &mut Vec<u8>| -> io::Result<usize> {
-        let mut _in = input.take(bufsize);
-        if is_stdin_tty && is_stdout_tty {
-            // read up until newline when interactive
+    // Alternatively provide `bufch` to break on a specific byte char
+    let mut read = |buffer: &mut Vec<u8>, bufch: u8| -> io::Result<usize> {
+        let mut input = input.take(bufsize);
+        // ie. read up until newline when interactive
+        if bufch > 0 {
             // TODO: totally unbuffered (character) mode?
-            return _in.read_until(NEWLINE_CH, buffer)
+            return input.read_until(bufch, buffer);
         };
-        _in.read_to_end(buffer)
+        input.read_to_end(buffer)
     };
     // Use `write_all` here to ensure we aren't dropping any output
     let mut write = |buffer: &mut Vec<u8>| -> io::Result<()> {
-        output.write_all(buffer)?;
-        if is_stdout_tty {
-            // output is a terminal and we've reached a newline
-            output.flush()?;
-        }
+        // TODO: how to prepend output ie. timestamps etc:
+        //let _buffer = ["[TEST] ".as_bytes(), buffer.as_slice()].concat();
+        //*buffer = _buffer;
+        output.write(buffer)?;
+        output.flush()?; //noop except when flushing on newlines
         buffer.clear();
         Ok(())
     };
+
+    let mut bufch: u8 = 0;
+    if is_stdin_tty || is_stdout_tty {
+        bufch = NEWLINE_CH;
+    }
     loop {
-        eprintln!("loop");
-        match read(&mut buffer) {
+        match read(&mut buffer, bufch) {
             // EOF
             Ok(0) => break,
             // Data in the buffer
@@ -166,16 +173,18 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
 
     // Only accept positional file arguments for now
     for mut file in args {
+        let mut _is_stdin = false;
         // You could also pass the stdin character devices explicitly...
         if file == "-" || file == "/dev/stdin" || file == "/proc/self/fd/0" {
             // Let's just use /dev/stdin across the board (for symlink follow metadata)
             file = String::from("/dev/stdin");
+            _is_stdin = true;
         }
 
+        let mut _both_reg: bool = false;
+        let mut _appending: bool = false;
         // Use `if let` here to ignore ENOENT error on non-existing files, etc
-        // TODO: strict mode?
-        let get_file_stat = || fs::metadata(&file);
-        if let Ok(_file_stat) = get_file_stat() {
+        if let Ok(_file_stat) = fs::metadata(&file) {
             if _file_stat.is_file()
                 && _stdout_stat.is_file()
                 && _file_stat.st_dev() == _stdout_stat.st_dev()
@@ -192,7 +201,7 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
                  * which results in a empty file regardless of whatever command is run. (ie. see `>foo` or `:>foo`)
                  */
                 let mut _compat = |file| {
-                    if file == "/dev/stdin" {
+                    if _is_stdin {
                         // $ ./rat < foo >> foo
                         // rat: -: input file is output file
                         return String::from("-");
@@ -205,21 +214,37 @@ fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
             if _file_stat.file_type().is_fifo() {
                 ibufsize = PIPE_DEF_PAGES * page_size;
             }
+            // If both files are regular we can attempt faster copy method
+            _both_reg = _file_stat.is_file() && _stdout_stat.is_file();
+            // Destination hasn't been truncated, we're appending
+            _appending = _stdout_stat.st_size() > 0;
         }
 
-        // TODO: this will unnescessarily re-open /dev/stdin as fd=3 (no impact)
         // TODO: fadvise(POSIX_FADV_SEQUENTIAL) ?
-        match File::open(&file) {
-            Ok(f) => {
-                // Attempt copy_cat equivalent (uses `copy_file_range`)
-                // /dev/stdout can be a symlink to our output
-                if let Ok(_) = fs::copy(file, "/dev/stdout") {
-                    continue;
+        // Why is it so difficult to manage these file descriptors in rust?
+        let _open_file = || {
+            if _is_stdin {
+                return Ok(unsafe { File::from_raw_fd(STDIN_FD) });
+            };
+            File::open(&file)
+        };
+
+        match _open_file() {
+            Ok(mut f) => {
+                // Attempt copy_cat equivalent (this falls back to 8192 buffers)
+                // If we detect that we're appending, skip this, to use bigger buffers
+                if _both_reg && !_appending {
+                    // TODO: io::copy seems to use sendfile() first then copy_file_range()
+                    // this also falls back to 8192 buffers for read/write ie. if appending
+                    if let Ok(_) = io::copy(&mut f, &mut stdout) {
+                        continue;
+                    }
                 };
                 simple_cat(
                     BufReader::new(f).by_ref(),
                     &mut stdout,
                     minbufsize(ibufsize, obufsize),
+                    _is_stdin,
                 )?
             }
             Err(e) => {

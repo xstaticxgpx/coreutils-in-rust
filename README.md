@@ -16,7 +16,7 @@ https://github.com/uutils/coreutils/
 
 ### Usage
 
-As run on and compared to: i7-6800K / 128GB DDR4 (file reads cached) / Linux 6.3.9 / coreutils 9.3 / uutils 0.0.20
+As run on and compared to: i7-6800K / 128GB DDR4 (file reads cached) / Linux 6.3.9 / btrfs (CoW) / coreutils 9.3 / uutils 0.0.20
 
 #### Regular file -> regular file (uses `copy_file_range` if possible)
 
@@ -24,11 +24,11 @@ As run on and compared to: i7-6800K / 128GB DDR4 (file reads cached) / Linux 6.3
 # 4GB random data sample
 $ dd if=/dev/urandom of=test.rand bs=1MB count=4096
 $ time rat test.rand >test.$(date +%s)
-real    0m0.004s
-user    0m0.004s
-sys     0m0.000s
+real    0m1.715s # <--- io::copy uses sendfile() first then copy_file_range() :(
+user    0m0.001s
+sys     0m1.710s
 $ time cat test.rand >test.$(date +%s)
-real    0m0.004s
+real    0m0.004s # <--- cat uses copy_file_range() all the time, great for btrfs
 user    0m0.004s
 sys     0m0.000s
 ```
@@ -40,10 +40,10 @@ $ rat test.rand | pv -r >/dev/null
 $ cat test.rand | pv -r >/dev/null
 [2.02GiB/s] # <-- cat does 128K writes onto FIFO pipe but 64K reads (??)
 
-$ timeout 5 rat /dev/zero | pv -r >/dev/null
-[5.12GiB/s]
-$ timeout 5 cat /dev/zero | pv -r >/dev/null
-[4.21GiB/s]
+$ timeout 5 rat </dev/zero | pv -ab >/dev/null
+25.2GiB [5.05GiB/s]
+$ timeout 5 cat </dev/zero | pv -ab >/dev/null
+16.0GiB [4.00GiB/s]
 ```
 
 #### Pipe <-> Pipe
