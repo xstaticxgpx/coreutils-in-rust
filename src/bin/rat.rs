@@ -37,27 +37,55 @@
  * --> escape characters mode (escape_default?)
  */
 
+use clap::Parser;
 use nix::fcntl;
+use nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL;
 use std::cmp::min;
-use std::env;
-use std::fs::{self, File};
+use std::fs::{File, Metadata};
 use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::os::fd::AsFd; //FromRawFd
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::FromRawFd; //AsRawFd
+use std::os::unix::io::AsRawFd;
 use std::process::ExitCode;
 
+#[derive(Debug, Parser)]
+#[command(author, version, about, long_about = None)] // Read from `Cargo.toml`
+#[command(next_line_help = true)]
+struct Cli {
+    /// Optional file paths to read, stdin by default
+    paths: Option<Vec<String>>,
+}
+
+// using i32 here since `fcntl::F_GETPIPE_SZ` calls returns the same
 const IO_BUFSIZE: i32 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 pages (4K each usually)
 const NEWLINE_CH: u8 = 10; // 0x0A
 const STDIN_FD: i32 = 0;
-const STDOUT_FD: i32 = 1;
+//const STDOUT_FD: i32 = 1;
 
-extern "C" fn get_pagesize() -> i64 {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) }
-}
-
+// TODO: use IsTerminal or something
 extern "C" fn isatty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) != 0 }
+}
+
+fn is_same_file(imeta: Metadata, ometa: &Metadata) -> bool {
+    if imeta.is_file()
+        && ometa.is_file()
+        && imeta.st_dev() == ometa.st_dev()
+        && imeta.st_ino() == ometa.st_ino()
+        && imeta.st_size() != 0
+    {
+        /*
+         * Same as coreutils cat.
+         *
+         * echo hello > foo
+         * rat foo >> foo
+         *
+         * Note the append (>>), when overwriting (>) the shell preemptively truncates the file.
+         */
+        return true;
+    }
+    false
 }
 
 /*
@@ -66,23 +94,22 @@ extern "C" fn isatty(fd: i32) -> bool {
  * https://github.com/rust-lang/rust/blob/8771282d4e7a5c4569e49d1f878fb3ba90a974d0/library/std/src/io/stdio.rs#L535
  * https://github.com/rust-lang/rust/blob/8771282d4e7a5c4569e49d1f878fb3ba90a974d0/library/std/src/io/buffered/linewriter.rs
  *
- * Instead, use BufWriter<File> on the raw file descriptor (std::io::StdoutRaw is not exposed)
+ * Instead, use BufWriter on the raw file descriptor (std::io::StdoutRaw is not exposed)
  * This seems like a common complaint:
  * https://github.com/rust-lang/rust/issues/58326
  * https://github.com/rust-lang/libs-team/issues/148
  */
-fn simple_cat(
+fn simple_rat(
     input: &mut BufReader<File>,
-    output: &mut BufWriter<File>,
-    bufsize: u64,
-    is_stdin: bool,
-) -> io::Result<()> {
-    // Vec<u8> holds binary UTF-8 characters, no concept of "text mode" here
-    let mut buffer: Vec<u8> = Vec::with_capacity(bufsize as usize);
-    // Use `take` and `read_to_end` to limit reads given the desired bufsize
-    // Alternatively provide `bufch` to break on a specific byte char
+    output: &mut BufWriter<&File>,
+    is_tty: bool,
+) -> io::Result<u64> {
+    // Fully buffered output by default
+    let mut _bufch: u8 = 0;
+
+    let cap: u64 = input.capacity().try_into().unwrap();
     let mut read = |buffer: &mut Vec<u8>, bufch: u8| -> io::Result<usize> {
-        let mut input = input.take(bufsize);
+        let mut input = input.take(cap);
         // ie. read up until newline when interactive
         if bufch > 0 {
             return input.read_until(bufch, buffer);
@@ -93,29 +120,29 @@ fn simple_cat(
     let mut write = |buffer: &mut Vec<u8>| -> io::Result<()> {
         // TODO: how to prepend output ie. timestamps etc:
         // Insert generic functions here for arbitrary formatting?
-        //let _buffer = ["[TEST] ".as_bytes(), buffer.as_slice()].concat();
-        //*buffer = _buffer;
-        //output.write(buffer)?;
-        // totally unbuffered (character) write mode:
+        //let _prefix = "[TEST] ".as_bytes();
+        //output.write(_prefix)?;
+        // TODO: totally unbuffered (character) write mode:
         //for i in 0..buffer.len() {
         //    output.write(&buffer[i..i+1])?;
         //    output.flush()?;
         //}
-        output.write_all(buffer.drain(..).as_ref())
+        output.write_all(buffer.drain(..).as_ref())?;
+        output.flush() // Noop unless we're line buffering?
     };
 
-    // Fully buffered output by default
-    let mut bufch: u8 = 0;
-    // Line buffered when we are fairly certain of interactive terminal
-    // Will also be needed for formatted output modes
-    let is_stdin_tty = is_stdin && isatty(STDIN_FD);
-    let is_stdout_tty = isatty(STDOUT_FD);
-    // cat doesn't care about stdout
-    if is_stdin_tty || is_stdout_tty {
-        bufch = NEWLINE_CH;
+    if is_tty {
+        // or format
+        _bufch = NEWLINE_CH;
+    } else {
+        // copy_cat equivalent, plus some `splice(2)` goodness for inter-pipe
+        return io::copy(input, output);
     }
+
+    // Fallback to custom IO loop for formatting/etc
+    let mut buffer = Vec::with_capacity(IO_BUFSIZE as usize);
     loop {
-        match read(&mut buffer, bufch) {
+        match read(&mut buffer, _bufch) {
             // EOF
             Ok(0) => break,
             // Data in the buffer
@@ -124,144 +151,106 @@ fn simple_cat(
             Err(e) => return Err(e),
         }
     }
-    // Just for sanity, also implicitly returns Ok(()) after loop break above
-    output.flush()
+    // We don't care about the result here, just needed for `return io::copy` above
+    Ok(0)
 }
 
-fn cli(ok: &mut bool, strict: bool) -> std::io::Result<()> {
-    // Get the common bufsize for IO given the specific inputs and outputs
-    // ie. regular files should r/w at the default 128KB buffer sizes
-    // fifo pipes should r/w at the max 64KB buffer size on Linux
-    // GNU cat notably attempts to write 128KB into fifo pipes and is slower
-    // This is assuming read()/write() calls with no splice magic (like `uu-cat`)
-    // https://man7.org/linux/man-pages/man2/splice.2.html
-    let page_size = get_pagesize();
-    let minbufsize = |i: i32, o: i32| -> u64 {
-        let _min = min(i, o) as i64;
-        if _min % page_size != 0 {
-            // Just for sanity, shouldn't ever happen?
-            panic!(
-                "minimum buffer is not aligned to page size: {} % {} != 0",
-                _min, page_size
-            )
-        }
-        _min as u64
-    };
+fn cli(ok: &mut bool, args: Cli) -> io::Result<()> {
+    //println!("{args:#?}");
+    // lock these standard file descriptors, later they are F_DUPFD_CLOEXEC during clone_to_owned
+    // hence fd=1 -> fd=3 below and maybe later fd=0 -> fd=4 (this is not a problem)
+    let (_stdin, _stdout) = (io::stdin().lock(), io::stdout().lock());
 
-    // Not sure these locks are necessary in our use case here
-    // Makes no difference
-    let (_, _) = (io::stdin().lock(), io::stdout().lock());
+    // stdout is re-used throughout the runtime, let's just reference it
+    let ref stdout = File::from(_stdout.as_fd().try_clone_to_owned()?);
+
     // Determine output characteristics, follows the /dev/stdout symlink
     let mut obufsize = IO_BUFSIZE;
-    let _stdout_stat = fs::metadata("/dev/stdout")?;
+    let _stdout_stat = stdout.metadata()?;
     if _stdout_stat.file_type().is_fifo() {
-        //obufsize = fcntl::fcntl(STDOUT_FD, fcntl::F_SETPIPE_SZ(IO_BUFSIZE))?;
-        obufsize = fcntl::fcntl(STDOUT_FD, fcntl::F_GETPIPE_SZ)?;
+        // Increasing pipes from the default 64K size doesn't seem to actually help
+        //fcntl::fcntl(stdout.as_raw_fd(), fcntl::F_SETPIPE_SZ(IO_BUFSIZE))?;
+        obufsize = fcntl::fcntl(stdout.as_raw_fd(), fcntl::F_GETPIPE_SZ)?;
     }
 
-    // Skip the 0th cmdline arg here and re-collect as Strings
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    // Pass implict stdin if not given any parameters
-    if args.len() == 0 {
-        args.push(String::from("-"));
-    }
+    // Is there a way to use the clap derive for default here?
+    let paths: Vec<_> = args.paths.unwrap_or_else(|| vec![String::from("-")]);
 
-    // stdout is re-used
-    let mut stdout = BufWriter::new(unsafe { File::from_raw_fd(STDOUT_FD) });
     // Only accept positional file arguments for now
-    for file in args {
+    for file in paths {
+        let handle: io::Result<_>;
+        let mut is_tty = false;
+        let mut is_stdin = false;
         let mut ibufsize = IO_BUFSIZE;
-        let mut _file = file.as_str();
+        let mut filename = file.as_str();
         // You could also pass the stdin character devices explicitly...
         if file == "-" || file == "/dev/stdin" || file == "/proc/self/fd/0" {
             // We want to keep the actual argument value for error message compatibility
             // But we need to get metadata via one of the symlinks (ie. we can't from `-`)
-            _file = "/dev/stdin";
-        }
-        let is_stdin = _file == "/dev/stdin";
-
-        let mut _both_reg: bool = false;
-        let mut _appending: bool = false;
-        // Use `if let` here to ignore ENOENT error on non-existing files, etc
-        if let Ok(_file_stat) = fs::metadata(_file) {
-            if _file_stat.is_file()
-                && _stdout_stat.is_file()
-                && _file_stat.st_dev() == _stdout_stat.st_dev()
-                && _file_stat.st_ino() == _stdout_stat.st_ino()
-                && _file_stat.st_size() != 0
-            {
-                /*
-                 * Same as coreutils cat.
-                 *
-                 * echo hello > foo
-                 * rat foo >> foo
-                 *
-                 * Note the append (>>), when overwriting (>) the shell completely truncates the file
-                 * which results in a empty file regardless of whatever command is run. (ie. see `>foo` or `:>foo`)
-                 */
-                eprintln!("rat: {}: input file is output file", file);
-                *ok &= false;
-                continue;
-            }
-            if _file_stat.file_type().is_fifo() {
-                //ibufsize = fcntl::fcntl(STDIN_FD, fcntl::F_SETPIPE_SZ(IO_BUFSIZE))?;
-                ibufsize = fcntl::fcntl(STDIN_FD, fcntl::F_GETPIPE_SZ)?;
-            }
-            // If both files are regular we can attempt faster copy method
-            _both_reg = _file_stat.is_file() && _stdout_stat.is_file();
-            // Destination hasn't been truncated, we're appending
-            _appending = _stdout_stat.st_size() > 0;
+            filename = "/dev/stdin";
+            is_stdin = true;
         }
 
-        // TODO: fadvise(POSIX_FADV_SEQUENTIAL) ?
-        // Why is it so difficult to manage these file descriptors in rust?
-        let _open_file = || {
-            if is_stdin {
-                return Ok(unsafe { File::from_raw_fd(STDIN_FD) });
-            };
-            File::open(&file)
-        };
+        // We need handle to be consistent File - how else could we do this DRYly?
+        // maybe passing `dyn` type to the BufReader or some other generic-ism?
+        if is_stdin {
+            handle = Ok(File::from(_stdin.as_fd().try_clone_to_owned()?));
+            is_tty = isatty(STDIN_FD);
+        } else {
+            handle = File::open(filename);
+        }
 
-        match _open_file() {
-            Ok(mut f) => {
-                // Attempt copy_cat equivalent
-                // If we detect that we're appending, skip this, to use bigger buffers
-                if _both_reg && !_appending {
-                    // TODO: io::copy seems to use sendfile() first then copy_file_range()
-                    // this also falls back to 8192 buffers for read/write ie. if appending
-                    if let Ok(_) = io::copy(&mut f, &mut stdout) {
-                        continue;
-                    }
-                };
-                simple_cat(
-                    BufReader::new(f).by_ref(),
-                    &mut stdout,
-                    minbufsize(ibufsize, obufsize),
-                    is_stdin,
-                )?
+        match handle {
+            Ok(input) => {
+                // cat also does this regardless of input type, discards any errors, ie. ESPIPE
+                let _ = nix::fcntl::posix_fadvise(input.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
+                if is_same_file(input.metadata()?, &_stdout_stat) {
+                    *ok &= false;
+                    eprintln!("rat: {file}: input file is output file");
+                    continue;
+                }
+                // Decoupling the buffer sizes causes massive performance hit
+                ibufsize = min(ibufsize, obufsize);
+                simple_rat(
+                    // cat uses a single shared buffer to read into and write from
+                    // that doesn't seem possible in rust using safe interfaces (??)
+                    // So, ultimately we have 3 buffers: 1 in, 1 out, 1 to move data between
+                    BufReader::with_capacity(ibufsize as usize, input).by_ref(),
+                    BufWriter::with_capacity(obufsize as usize, stdout).by_ref(),
+                    is_tty,
+                )
+                .unwrap_or_else(|e| {
+                    // TODO: this catches trying to read directories/etc
+                    // slightly different than cat like this:
+                    // cat: t: Is a directory
+                    // rat: t: Is a directory (os error 21)
+                    eprintln!("rat: {file}: {}", e);
+                    42u64 // Why not?
+                });
             }
             Err(e) => {
                 *ok &= false;
                 //eprintln!("{:#?}", e);
                 match e.kind() {
-                    ErrorKind::NotFound => eprintln!("rat: {}: No such file or directory", &file),
-                    ErrorKind::PermissionDenied => eprintln!("rat: {}: Permission denied", &file),
+                    // Also
+                    // rat: $#t: No such file or directory
+                    // cat: '$#t': No such file or directory
+                    ErrorKind::NotFound => eprintln!("rat: {file}: No such file or directory"),
+                    ErrorKind::PermissionDenied => eprintln!("rat: {file}: Permission denied"),
                     _ => todo!(),
                 };
-                if strict {
-                    // This needs to happen earlier.
-                    return Err(e);
-                }
             }
         }
     }
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
+fn main() -> ExitCode {
     // `ok` tracks if any file errors occurred in the loop
     let mut ok = true;
-    let _ = cli(&mut ok, false);
+    cli(&mut ok, Cli::parse()).unwrap_or_else(|e| {
+        eprintln!("{:#?}", e);
+    });
     match ok {
         true => ExitCode::SUCCESS,
         false => ExitCode::FAILURE,

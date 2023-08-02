@@ -1,6 +1,6 @@
 [package]
 name = "ratiscat"
-version = "0.3.1"
+version = "0.4"
 edition = "2021"
 authors = ["xstaticxgpx"]
 license = "MIT"
@@ -22,6 +22,7 @@ default-run = "rat"
 #anyhow = "1.0"
 libc = "0.2"
 nix = "0.26"
+clap = { version = "4.0", features = ["derive"] }
 
 [profile.release-lto]
 inherits = "release"

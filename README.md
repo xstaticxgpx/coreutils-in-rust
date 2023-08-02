@@ -1,6 +1,6 @@
 # ratiscat
 
-`rat` is a performance _matching_ re-implementation of `cat` in rust
+`rat` is a performant re-implementation of `cat` in rust
 
 Turns out a rat fits in a pipe better than a cat anyways.
 
@@ -8,9 +8,7 @@ Turns out a rat fits in a pipe better than a cat anyways.
 
 See [`rat.rs`](/src/bin/rat.rs)
 
-Maintaining the `read()` / `write()` syscalls pattern via rust abstractions, with a few improvements.
-
-For much higher performance check out the usage of splice in `uu-cat` (comparison below).
+Also checkout the `uutils` project:
 
 https://github.com/uutils/coreutils/
 
@@ -18,40 +16,43 @@ https://github.com/uutils/coreutils/
 
 As run on and compared to: i7-6800K / 128GB DDR4 (file reads cached) / Linux 6.3.9 / btrfs (CoW) / coreutils 9.3 / uutils 0.0.20
 
-#### Regular file -> regular file (uses `copy_file_range` if possible)
+#### Basic functionality (raw I/O)
 
 ```
 # 4GB random data sample
 $ dd if=/dev/urandom of=test.rand bs=1MB count=4096
+
+# file to file
+
 $ time rat test.rand >test.$(date +%s)
-real    0m1.715s # <--- io::copy uses sendfile() first then copy_file_range() :(
+real    0m1.715s # <-- io::copy uses sendfile() first then copy_file_range() :(
 user    0m0.001s
 sys     0m1.710s
 $ time cat test.rand >test.$(date +%s)
-real    0m0.004s # <--- cat uses copy_file_range() all the time, great for btrfs
+real    0m0.004s # <-- cat uses copy_file_range() all the time, great for btrfs
 user    0m0.004s
 sys     0m0.000s
-```
 
-#### Regular file or character device -> Pipe (FIFO)
-```
+# file to pipe
+
 $ rat test.rand | pv -r >/dev/null
-[2.69GiB/s] # <-- rat does 64K R/W on FIFO pipes, smaller buffers are better sometimes
+[2.69GiB/s] # <-- rat automagically configures size for FIFO pipes
 $ cat test.rand | pv -r >/dev/null
-[2.02GiB/s] # <-- cat does 128K writes onto FIFO pipe but 64K reads (??)
+[2.02GiB/s] # <-- cat does 128K writes onto default 64K sized FIFO pipe (???)
+
+# from char devices
 
 $ timeout 5 rat </dev/zero | pv -ab >/dev/null
 25.2GiB [5.05GiB/s]
 $ timeout 5 cat </dev/zero | pv -ab >/dev/null
 16.0GiB [4.00GiB/s]
-```
 
-#### Pipe <-> Pipe
-```
+# between pipes
+
 $ timeout -s SIGINT 5 yes | rat | pv -r >/dev/null
-[2.85GiB/s]
+[4.68GiB/s]
 $ timeout -s SIGINT 5 yes | cat | pv -r >/dev/null
-[2.86GiB/s]
+[2.80GiB/s]
 ```
 
 #### Argument ordering, error logging, sanity checks
@@ -71,7 +72,7 @@ $ cat < foo >> foo
 cat: -: input file is output file
 ```
 
-#### Some comparisons with `pv` and `uu-cat` (which use splice - try `pv --no-splice`)
+#### Some comparisons with `pv` and `uu-cat`
 ```
 $ timeout 5 pv -r </dev/zero >/dev/null
 [20.3GiB/s]
@@ -81,12 +82,31 @@ $ timeout 5 pv -r </dev/zero | pv -q >/dev/null
 [3.39GiB/s]
 $ timeout 5 pv -r </dev/zero | uu-cat >/dev/null
 [3.66GiB/s]
+$ timeout 5 pv -r </dev/zero | rat >/dev/null
+[3.26GiB/s]
 $ timeout 5 pv -r </dev/zero | pv -q --no-splice >/dev/null
 [2.70GiB/s]
-$ timeout 5 pv -r </dev/zero | rat >/dev/null
-[2.71GiB/s]
 $ timeout 5 pv -r </dev/zero | cat >/dev/null
 [2.66GiB/s]
+```
+
+#### Increases throughput by configuring pipe sizes
+```
+$ timeout 5 cat </dev/zero | pv -abC >/dev/null
+10.8GiB [2.71GiB/s]
+$ timeout 5 cat </dev/zero | rat | pv -abC >/dev/null # without splice
+17.7GiB [3.54GiB/s]
+$ timeout 5 cat </dev/zero | rat | pv -ab >/dev/null  # with splice
+19.4GiB [3.88GiB/s]
+```
+
+#### Splice it up!
+```
+$ timeout 5 rat </dev/zero | rat | rat | rat | pv -r >/dev/null
+[4.78GiB/s]
+
+$ timeout 5 rat </dev/zero | cat | cat | cat | pv -r >/dev/null
+[2.16GiB/s]
 ```
 
 ### Motivation
@@ -101,7 +121,7 @@ I intend to make `rat` nearly the same as `cat` (uutils already did all this) bu
 - Strict mode - pre-emptively detect errors ie. missing files / permissions before providing possibly mangled output
 - Human readable, colorized output of any generic text stream based on patterns (ie. red errors, blue debugs, etc)
 
-Things learned so far in general:
+### Thoughts / Notes
 
 - `Stdout` in rust will always be wrapped by `LineWriter` which flushes the buffer on [new lines][6]. This seems fine for interactive stdin.
 
@@ -126,15 +146,23 @@ Things learned so far in general:
 
 - GNU `cat` has odd behavior when writing to pipes, it clearly attempts to write its default 128K buffer size which subsequently reduces the performance.
 
-  Only happens when on the left-side of the pipe (writing), reading pipes will fill and flush the 64K buffer immediately as expected. In between pipes (ie. `echo | cat | grep`) will perform 64K read and write.
+  Only happens when on the left-side of the pipe (writing), reading pipes will fill and flush the 64K buffer immediately as expected. In between pipes (ie. `echo | cat | grep -`) will perform 64K read and write.
 
   `rat` easily acheives ~500MB-1GBps+ more throughput here by using the proper pipe buffer size (see above)
+
+- rust `io::copy` currently insists on using `sendfile()` first and then using `copy_file_range()` on subsequent calls during the same runtime (ie. when given multiple parameters), also the `copy_file_range()` length is way lower than `cat` for example (`1073741824` vs `9223372035781033984`)
+  
+  Reported and fixed: https://github.com/rust-lang/rust/issues/114341
+  
+- How can `copy_file_range()` concatenate a file multiple times (ie. each syscall is appending to the file) and yet doesn't work (EBADF) when appending from shell?
+
+### Upstream bug fixes
+
+- https://github.com/rust-lang/rust/pull/114373
 
 ### Known Bugs
 
 See `TODO` in [`rat.rs`](/src/bin/rat.rs)
-
-- Ctrl+D needs to be pressed twice while interactive
 
 [//]: # (References)
 [1]: https://news.ycombinator.com/item?id=31592934
