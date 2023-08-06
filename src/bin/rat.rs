@@ -42,7 +42,7 @@ use nix::fcntl;
 use nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL;
 use std::cmp::min;
 use std::fs::{File, Metadata};
-use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::FileTypeExt;
@@ -69,13 +69,6 @@ struct Cli {
 // using i32 here since `fcntl::F_GETPIPE_SZ` calls returns the same
 const IO_BUFSIZE: i32 = 1 << 17; // or 2^17 or 131072 (bytes) or 32 pages (4K each usually)
 const NEWLINE_CH: u8 = 10; // 0x0A
-const STDIN_FD: i32 = 0;
-const STDOUT_FD: i32 = 1;
-
-// TODO: use IsTerminal or something
-extern "C" fn isatty(fd: i32) -> bool {
-    unsafe { libc::isatty(fd) != 0 }
-}
 
 fn is_same_file(imeta: &Metadata, ometa: &Metadata) -> bool {
     imeta.is_file()
@@ -183,7 +176,7 @@ fn cli(ok: &mut bool, mut args: Cli) -> io::Result<()> {
         .unwrap_or_else(|| vec![String::from("-")]);
 
     for file in paths {
-        let mut is_tty = isatty(STDOUT_FD); // false here allows io::copy to sendfile to interactive stdout (!?)
+        let mut is_tty = stdout.is_terminal(); // false here allows io::copy to sendfile to interactive stdout (!?)
         let mut is_stdin = false;
         let mut ibufsize = IO_BUFSIZE;
         let mut filename = file.as_str();
@@ -200,7 +193,7 @@ fn cli(ok: &mut bool, mut args: Cli) -> io::Result<()> {
         let handle: io::Result<_>;
         let _fhandle: File;
         if is_stdin {
-            is_tty |= isatty(STDIN_FD);
+            is_tty |= stdin.is_terminal();
             handle = Ok(stdin);
         } else {
             let _result = File::open(filename);

@@ -1,6 +1,6 @@
 # ratiscat
 
-`rat` is a performant re-implementation of `cat` in rust
+`rat` is cat reimplemented in rust with some new features
 
 Turns out a rat fits in a pipe better than a cat anyways.
 
@@ -8,9 +8,11 @@ Turns out a rat fits in a pipe better than a cat anyways.
 
 See [`rat.rs`](/src/bin/rat.rs)
 
-Also checkout the `uutils` project:
+Also checkout the `uutils` project and `bat`:
 
 https://github.com/uutils/coreutils/
+
+https://github.com/sharkdp/bat
 
 ### Usage
 
@@ -26,7 +28,7 @@ $ dd if=/dev/urandom of=test.rand bs=1MB count=4096
 
 $ time rat test.rand >test.$(date +%s)
 real    0m1.715s # <-- io::copy uses sendfile() first then copy_file_range() :(
-user    0m0.001s
+user    0m0.001s # (fixed upstream)
 sys     0m1.710s
 $ time cat test.rand >test.$(date +%s)
 real    0m0.004s # <-- cat uses copy_file_range() all the time, great for btrfs
@@ -72,41 +74,28 @@ $ cat < foo >> foo
 cat: -: input file is output file
 ```
 
-#### Some comparisons with `pv` and `uu-cat`
+#### Increases throughput via pipes
 ```
-$ timeout 5 pv -r </dev/zero >/dev/null
-[20.3GiB/s]
-$ timeout 5 yes | pv -r >/dev/null
-[6.13GiB/s]
-$ timeout 5 pv -r </dev/zero | pv -q >/dev/null
-[3.39GiB/s]
-$ timeout 5 pv -r </dev/zero | uu-cat >/dev/null
-[3.66GiB/s]
-$ timeout 5 pv -r </dev/zero | rat >/dev/null
-[3.26GiB/s]
-$ timeout 5 pv -r </dev/zero | pv -q --no-splice >/dev/null
-[2.70GiB/s]
-$ timeout 5 pv -r </dev/zero | cat >/dev/null
-[2.66GiB/s]
-```
-
-#### Increases throughput by configuring pipe sizes
-```
+# No splice
+$ timeout 5 rat --no-iocopy </dev/zero | pv -abC >/dev/null
+12.2GiB [3.05GiB/s]
 $ timeout 5 cat </dev/zero | pv -abC >/dev/null
 10.8GiB [2.71GiB/s]
-$ timeout 5 cat </dev/zero | rat | pv -abC >/dev/null # without splice
-17.7GiB [3.54GiB/s]
-$ timeout 5 cat </dev/zero | rat | pv -ab >/dev/null  # with splice
+## Diminishing returns with stack copy (read/write syscalls)
+$ timeout 5 cat </dev/zero | cat | cat | cat | cat | pv -abC >/dev/null
+10.7GiB [2.15GiB/s]
+
+
+# Splice it up!
+$ timeout 5 cat </dev/zero | rat | pv -ab >/dev/null  # read/write -> splice -> splice
 19.4GiB [3.88GiB/s]
-```
-
-#### Splice it up!
-```
-$ timeout 5 rat </dev/zero | rat | rat | rat | pv -r >/dev/null
-[4.78GiB/s]
-
-$ timeout 5 rat </dev/zero | cat | cat | cat | pv -r >/dev/null
-[2.16GiB/s]
+$ timeout 5 cat </dev/zero | rat | pv -abC >/dev/null # read/write -> splice -> read/write
+17.7GiB [3.54GiB/s]
+## Less diminishing returns with zero-copy splice
+$ timeout 5 cat </dev/zero | rat | rat | rat | rat | pv -ab >/dev/null
+14.9GiB [3.73GiB/s]
+$ timeout 5 cat </dev/zero | rat | rat | rat | rat | rat | rat | rat | rat | pv -ab >/dev/null
+14.4GiB [3.59GiB/s]
 ```
 
 ### Motivation
@@ -136,13 +125,16 @@ I intend to make `rat` nearly the same as `cat` (uutils already did all this) bu
 
 - `splice(2)` can show some insane performance improvements over traditional read()/write() calls
 
-  However, these benefits are only fully realized under specifics conditions (ie. `</dev/zero >/dev/null`) which don't apply to writes on regular files.
+  However, these benefits are only fully realized under specifics conditions (ie. pipes or `</dev/zero >/dev/null`) which don't apply to writes on regular files.
+
   There is still an improvement over traditional syscalls.
   Probably excellent for [network sockets...](https://blog.superpat.com/zero-copy-in-linux-with-sendfile-and-splice)
 
 - Linux pipes are limited to 64K buffers by default. They can be increased up to the sysctl `fs.pipe-max-size` setting (1MB by default).
 
   You can tweak pipes using `fcntl()` - see [pipe(7) - Pipe Capacity](https://man7.org/linux/man-pages/man7/pipe.7.html) and [fcntl(2) - Changing the capacity of a pipe](https://man7.org/linux/man-pages/man2/fcntl.2.html).
+
+  Increasing pipe size doesn't seem to make any noticeable improvement.
 
 - GNU `cat` has odd behavior when writing to pipes, it clearly attempts to write its default 128K buffer size which subsequently reduces the performance.
 
@@ -151,10 +143,10 @@ I intend to make `rat` nearly the same as `cat` (uutils already did all this) bu
   `rat` easily acheives ~500MB-1GBps+ more throughput here by using the proper pipe buffer size (see above)
 
 - rust `io::copy` currently insists on using `sendfile()` first and then using `copy_file_range()` on subsequent calls during the same runtime (ie. when given multiple parameters), also the `copy_file_range()` length is way lower than `cat` for example (`1073741824` vs `9223372035781033984`)
-  
+
   Reported and fixed: https://github.com/rust-lang/rust/issues/114341
-  
-- How can `copy_file_range()` concatenate a file multiple times (ie. each syscall is appending to the file) and yet doesn't work (EBADF) when appending from shell?
+
+  How can `copy_file_range()` concatenate a file multiple times (ie. each syscall is appending to the file) and yet doesn't work (EBADF) when appending from shell? Some internal guarantee in the kernel across seperate calls?
 
 ### Upstream bug fixes
 

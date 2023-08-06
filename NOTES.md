@@ -4,6 +4,12 @@
 grep -v '^[ /]\+[*/]' examples/cat.rs | grep -v '^$'
 ```
 
+#### Wrapping cargo tests with ie. strace/valgrind
+```
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="strace" cargo test
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind" cargo test
+```
+
 
 ### String conversion
 
